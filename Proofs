@@ -1,0 +1,285 @@
+import pandas as pd
+import os
+import re
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, PageBreak, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+
+styles = getSampleStyleSheet()
+normal_style = ParagraphStyle(name="NormalSmall", parent=styles["Normal"], fontSize=8, leading=9, alignment=1)
+header_style = ParagraphStyle(name="HeaderSmall", parent=styles["Normal"], fontSize=8, leading=9, alignment=1)
+
+width, height = letter
+
+# ===== HELPERS =====
+def clean_text(x):
+    if pd.isna(x):
+        return ""
+    return " ".join(str(x).strip().lower().split())
+
+
+def get_fixed_columns(df):
+    for i, col in enumerate(df.columns):
+        if str(col).strip().lower() in ["fire", "risk"]:
+            return list(df.columns[:i])
+    return [df.columns[0]]
+
+
+def format_value(val):
+    try:
+        return f"{float(val):.4f}"
+    except:
+        return str(val)
+
+
+def transform_display(val):
+    try:
+        int_val = int(float(val))
+        if int_val < -10:
+            return "No information"
+        if int_val >= 1000:
+            return ">1000"
+        return str(int_val)
+    except:
+        return str(val)
+
+
+def format_date(val):
+    try:
+        return pd.to_datetime(val).strftime("%m/%d/%Y")
+    except:
+        return str(val)
+
+
+def safe_para(val):
+    val = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return Paragraph(val, normal_style)
+
+
+def header_para(text):
+    return Paragraph(f"<b>{text}</b>", header_style)
+
+
+def parse_footnote(text):
+    left   = re.search(r'left\s*"([^"]*)"',   text)
+    center = re.search(r'center\s*"([^"]*)"', text)
+    right  = re.search(r'right\s*"([^"]*)"',  text)
+    return (
+        left.group(1).strip()   if left   else "",
+        center.group(1).strip() if center else "",
+        right.group(1).strip()  if right  else ""
+    )
+
+
+def find_sheet_name_ci(excel_path, target_name):
+    """
+    Return the actual sheet name inside excel_path that matches target_name
+    case-insensitively (and ignoring surrounding whitespace).
+    Raises ValueError if no match is found.
+    """
+    xl = pd.ExcelFile(excel_path)
+    target_clean = str(target_name).strip().lower()
+    for sheet in xl.sheet_names:
+        if str(sheet).strip().lower() == target_clean:
+            return sheet
+    raise ValueError(
+        f"No sheet matching '{target_name}' (case-insensitive) found in {excel_path}. "
+        f"Available sheets: {xl.sheet_names}"
+    )
+
+
+# ===== HEADER / FOOTER =====
+def make_page_drawer(titles, version_text, footer_center, footer_right, page_cnt_title):
+
+    page_counter = {"count": 0}
+
+    def draw_page(canvas, doc):
+        page_counter["count"] += 1
+
+        canvas.setFont("Helvetica-Bold", 10)
+        y = height - 30
+        for t in titles:
+            if t:
+                canvas.drawCentredString(width / 2, y, str(t))
+                y -= 13
+
+        canvas.setFont("Helvetica", 8)
+        text = f"Effective: {format_date(version_text)}"
+        canvas.drawString(40, 35, text)
+
+        canvas.drawCentredString(width / 2, 35, footer_center or "")
+        canvas.drawRightString(width - 40, 35, footer_right)
+
+        page_text = f"{page_cnt_title} {page_counter['count']}"
+        canvas.drawRightString(width - 40, 20, page_text)
+
+    return draw_page
+
+
+# ===== PDF BUILDER =====
+def build_pdf(df, path, drawer, fixed_cols):
+
+    doc = SimpleDocTemplate(
+        path,
+        pagesize=letter,
+        leftMargin=40, rightMargin=40,
+        topMargin=110,
+        bottomMargin=55
+    )
+
+    elements = []
+    max_cols = 8
+
+    display_cols = list(df.columns)
+    fixed_cols   = [c for c in fixed_cols if c in display_cols]
+    scrollable_cols = [c for c in display_cols if c not in fixed_cols]
+
+    SAFETY = 15
+    usable_height = doc.height - SAFETY
+
+    def get_para(df, row_idx, col):
+        val = df.iloc[row_idx][col]
+        if isinstance(val, Paragraph):
+            return Paragraph(val.text, val.style)
+        val = transform_display(val) if col in fixed_cols else format_value(val)
+        return safe_para(val)
+
+    def make_table(col_chunk, row_start, row_end):
+        col_widths = (
+            [70] * len(col_chunk)
+            if len(col_chunk) < 5
+            else [doc.width / len(col_chunk)] * len(col_chunk)
+        )
+        data = [[header_para(c) for c in col_chunk]]
+        for idx in range(row_start, row_end):
+            data.append([get_para(df, idx, col) for col in col_chunk])
+
+        t = Table(data, colWidths=col_widths, splitByRow=1, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("GRID",          (0, 0), (-1, -1), 1, colors.black),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+            ("TOPPADDING",    (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        return t, col_widths
+
+    def measure_row_end(col_chunk, row_start):
+        col_widths = (
+            [70] * len(col_chunk)
+            if len(col_chunk) < 5
+            else [doc.width / len(col_chunk)] * len(col_chunk)
+        )
+        table_width = sum(col_widths)
+
+        row_end = row_start
+        for probe_i in range(row_start, len(df)):
+            t, _ = make_table(col_chunk, row_start, probe_i + 1)
+            _, h = t.wrap(table_width, usable_height)
+            if h > usable_height:
+                break
+            row_end = probe_i + 1
+        return row_end
+
+    row_start = 0
+    while row_start < len(df):
+
+        # Build column chunks
+        all_chunks = []
+        col_start = 0
+        while col_start < len(scrollable_cols):
+            col_end = min(col_start + (max_cols - len(fixed_cols)), len(scrollable_cols))
+            all_chunks.append(fixed_cols + scrollable_cols[col_start:col_end])
+            col_start = col_end
+
+        # Find minimum row_end across all chunks
+        row_end = len(df)
+        for chunk in all_chunks:
+            row_end = min(row_end, measure_row_end(chunk, row_start))
+
+        if row_end <= row_start:
+            row_end = row_start + 1
+
+        # Render all chunks for this row slice
+        for columns in all_chunks:
+            col_widths = (
+                [70] * len(columns)
+                if len(columns) < 5
+                else [doc.width / len(columns)] * len(columns)
+            )
+
+            data = [[header_para(c) for c in columns]]
+            for idx in range(row_start, row_end):
+                data.append([get_para(df, idx, col) for col in columns])
+
+            table = Table(data, colWidths=col_widths, hAlign="LEFT", splitByRow=1, repeatRows=1)
+            table.setStyle(TableStyle([
+                ("GRID",          (0, 0), (-1, -1), 1, colors.black),
+                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+                ("TOPPADDING",    (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]))
+
+            elements.append(table)
+            elements.append(PageBreak())
+
+        row_start = row_end
+
+    doc.build(elements, onFirstPage=drawer, onLaterPages=drawer)
+
+
+# ===== MAIN FUNCTION =====
+def generate_single_reports(input_file, config_file, output_folder):
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    input_df = pd.read_excel(input_file, sheet_name="Filing_tabs")
+    input_df.columns = input_df.columns.str.strip().str.lower()
+
+    all_pdfs = []
+
+    for _, row in input_df.iterrows():
+
+        memname = str(row.get("memname", "")).strip()
+        if not memname:
+            continue
+
+        print(f" Processing: {memname}")
+
+        # Case-insensitive sheet name lookup
+        sheet_name = find_sheet_name_ci(config_file, memname)
+
+        df = pd.read_excel(config_file, sheet_name=sheet_name).fillna("")
+        df = df.applymap(clean_text)
+
+        fixed_cols = get_fixed_columns(df)
+
+        titles         = [str(row.get(f"title{i}", "")) for i in range(1, 5)]
+        version        = str(row.get("version_current", ""))
+        page_cnt_title = str(row.get("page_cnt_title", ""))
+        _, center, right = parse_footnote(str(row.get("footnote1", "")))
+
+        drawer = make_page_drawer(titles, version, center, right, page_cnt_title)
+
+        pdf_path = os.path.join(output_folder, f"{memname}.pdf")
+        build_pdf(df, pdf_path, drawer, fixed_cols)
+
+        all_pdfs.append(pdf_path)
+        print(f"    Saved: {pdf_path}")
+
+    print(" DONE")
+
+    return all_pdfs
+
+
+if __name__ == "__main__":
+    # Example usage
+    generate_single_reports(
+        input_file=r"D:\filling_input_exl\input.xlsx",
+        config_file=r"D:\filling_input_exl\config2.xlsx",
+        output_folder=r"D:\filling_input_exl",
+    )
