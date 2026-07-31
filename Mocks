@@ -1,0 +1,400 @@
+import pandas as pd
+import os
+import re
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, PageBreak, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+
+styles = getSampleStyleSheet()
+normal_style = ParagraphStyle(name="NormalSmall", parent=styles["Normal"], fontSize=8, leading=9, alignment=1)
+header_style = ParagraphStyle(name="HeaderSmall", parent=styles["Normal"], fontSize=8, leading=9, alignment=1)
+
+width, height = letter
+
+# ===== HELPERS =====
+def clean_text(x):
+    if pd.isna(x):
+        return ""
+    return " ".join(str(x).strip().lower().split())
+
+
+def build_key(df, cols):
+    return df[cols].apply(lambda r: "|".join(clean_text(v) for v in r), axis=1)
+
+
+def get_fixed_columns(df):
+    for i, col in enumerate(df.columns):
+        if str(col).strip().lower() in ["fire", "risk"]:
+            return list(df.columns[:i])
+    return [df.columns[0]]
+
+
+def format_value(val):
+    try:
+        return f"{float(val):.4f}"
+    except:
+        return str(val)
+
+
+def transform_display(val):
+    try:
+        int_val = int(float(val))
+        if int_val < -10:
+            return "No information"
+        if int_val >= 1000:
+            return ">1000"
+        return str(int_val)
+    except:
+        return str(val)
+
+
+def format_date(val):
+    try:
+        return pd.to_datetime(val).strftime("%m/%d/%Y")
+    except:
+        return str(val)
+
+
+def normalize(val):
+    if pd.isna(val) or val == "":
+        return ""
+    try:
+        return str(float(val)).rstrip('0').rstrip('.')
+    except:
+        return str(val).strip().lower()
+
+
+def safe_para(val):
+    val = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return Paragraph(val, normal_style)
+
+
+def strike_text(val):
+    return Paragraph(f'<font color="red"><strike>{val}</strike></font>', normal_style)
+
+
+def header_para(text):
+    return Paragraph(f"<b>{text}</b>", header_style)
+
+
+def parse_footnote(text):
+    left = re.search(r'left\s*"([^"]*)"', text)
+    center = re.search(r'center\s*"([^"]*)"', text)
+    right = re.search(r'right\s*"([^"]*)"', text)
+    return (
+        left.group(1).strip() if left else "",
+        center.group(1).strip() if center else "",
+        right.group(1).strip() if right else ""
+    )
+
+
+def find_sheet_name_ci(excel_path, target_name):
+    """
+    Return the actual sheet name inside excel_path that matches target_name
+    case-insensitively (and with surrounding whitespace ignored).
+    Raises ValueError if no match is found.
+    """
+    xl = pd.ExcelFile(excel_path)
+    target_clean = str(target_name).strip().lower()
+    for sheet in xl.sheet_names:
+        if str(sheet).strip().lower() == target_clean:
+            return sheet
+    raise ValueError(
+        f"No sheet matching '{target_name}' (case-insensitive) found in {excel_path}. "
+        f"Available sheets: {xl.sheet_names}"
+    )
+
+
+# ===== HEADER / FOOTER =====
+def make_page_drawer(titles, version_text, footer_center, footer_right, mode, page_cnt_title):
+
+    page_counter = {"count": 0}
+
+    def draw_page(canvas, doc):
+        page_counter["count"] += 1
+
+        canvas.setFont("Helvetica-Bold", 10)
+        y = height - 30
+        for t in titles:
+            if t:
+                canvas.drawCentredString(width / 2, y, str(t))
+                y -= 13
+
+        canvas.setFont("Helvetica", 8)
+        text = f"Effective: {format_date(version_text)}"
+
+        if mode == "strike":
+            canvas.setFillColor(colors.red)
+            canvas.drawString(40, 35, text)
+            canvas.line(40, 38, 40 + canvas.stringWidth(text, "Helvetica", 8), 38)
+            canvas.setFillColor(colors.black)
+        elif mode == "highlight":
+            canvas.setFillColor(colors.yellow)
+            canvas.rect(39, 33, canvas.stringWidth(text, "Helvetica", 8) + 4, 10, fill=1, stroke=0)
+            canvas.setFillColor(colors.black)
+            canvas.drawString(40, 35, text)
+        else:
+            canvas.drawString(40, 35, text)
+
+        canvas.drawCentredString(width / 2, 35, footer_center or "")
+        canvas.drawRightString(width - 40, 35, footer_right)
+
+        page_text = f"{page_cnt_title} {page_counter['count']}"
+        canvas.drawRightString(width - 40, 20, page_text)
+
+    return draw_page
+
+
+# ===== PDF BUILDER (FIXED OVERFLOW) =====
+def build_pdf(df, flag_df, path, highlight, drawer, fixed_cols):
+
+    doc = SimpleDocTemplate(
+        path,
+        pagesize=letter,
+        leftMargin=40, rightMargin=40,
+        topMargin=110,
+        bottomMargin=55
+    )
+
+    elements = []
+    max_cols = 8
+
+    display_cols = [c for c in df.columns if c != "__key__"]
+    fixed_cols = [c for c in fixed_cols if c in display_cols]
+    scrollable_cols = [c for c in display_cols if c not in fixed_cols]
+
+    # Small safety margin so measured height never touches frame boundary
+    SAFETY = 15
+    usable_height = doc.height - SAFETY
+
+    def get_para(df, row_idx, col):
+        val = df.iloc[row_idx][col]
+        if isinstance(val, Paragraph):
+            return Paragraph(val.text, val.style)
+        else:
+            val = transform_display(val) if col in fixed_cols else format_value(val)
+            return safe_para(val)
+
+    def make_table(col_chunk, row_start, row_end):
+        if len(col_chunk) < 5:
+            col_widths = [70] * len(col_chunk)
+        else:
+            col_widths = [doc.width / len(col_chunk)] * len(col_chunk)
+
+        data = [[header_para(c) for c in col_chunk]]
+        for idx in range(row_start, row_end):
+            data.append([get_para(df, idx, col) for col in col_chunk])
+
+        t = Table(data, colWidths=col_widths, splitByRow=1, repeatRows=1)  # ← key: no auto-split
+        t.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 1, colors.black),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        return t, col_widths
+
+    def measure_row_end(col_chunk, row_start):
+        if len(col_chunk) < 5:
+            col_widths = [70] * len(col_chunk)
+            table_width = sum(col_widths)
+        else:
+            col_widths = [doc.width / len(col_chunk)] * len(col_chunk)
+            table_width = doc.width
+
+        row_end = row_start
+        for probe_i in range(row_start, len(df)):
+            t, _ = make_table(col_chunk, row_start, probe_i + 1)
+            _, h = t.wrap(table_width, usable_height)
+            if h > usable_height:
+                break
+            row_end = probe_i + 1
+
+        return row_end
+
+    row_start = 0
+    while row_start < len(df):
+
+        # Build all column chunks
+        all_chunks = []
+        col_start = 0
+        while col_start < len(scrollable_cols):
+            col_end = min(col_start + (max_cols - len(fixed_cols)), len(scrollable_cols))
+            all_chunks.append(fixed_cols + scrollable_cols[col_start:col_end])
+            col_start = col_end
+
+        # Probe all chunks, take minimum row_end
+        row_end = len(df)
+        for chunk in all_chunks:
+            chunk_end = measure_row_end(chunk, row_start)
+            row_end = min(row_end, chunk_end)
+
+        if row_end <= row_start:
+            row_end = row_start + 1
+
+        # Render all chunks for rows [row_start, row_end)
+        for ci, columns in enumerate(all_chunks):
+            if len(columns) < 5:
+                col_widths = [70] * len(columns)
+                align_mode = 'LEFT'
+            else:
+                col_widths = [doc.width / len(columns)] * len(columns)
+                align_mode = 'LEFT'
+
+            data = [[header_para(c) for c in columns]]
+            for idx in range(row_start, row_end):
+                data.append([get_para(df, idx, col) for col in columns])
+
+            table = Table(data, colWidths=col_widths, hAlign=align_mode, splitByRow=1, repeatRows=1)  # ← no auto-split
+
+            style_cmd = [
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]
+
+            if highlight and flag_df is not None:
+                for r in range(1, len(data)):
+                    actual_index = row_start + (r - 1)
+                    if actual_index >= len(flag_df):
+                        continue
+                    for c in range(len(columns)):
+                        col_idx = df.columns.get_loc(columns[c])
+                        if flag_df.iloc[actual_index, col_idx]:
+                            style_cmd.append(
+                                ("BACKGROUND", (c, r), (c, r), colors.yellow)
+                            )
+
+            table.setStyle(TableStyle(style_cmd))
+            elements.append(table)
+
+            elements.append(PageBreak())
+
+        row_start = row_end
+
+    doc.build(elements, onFirstPage=drawer, onLaterPages=drawer)
+
+
+# ===== MAIN FUNCTION =====
+def generate_reports(input_file, config_1, config_2, output_folder):
+    """
+    Generate strike-through and highlight comparison PDFs for every memname
+    listed in the "Filing_tabs" sheet of `input_file`, comparing the matching
+    sheet in `config_1` against the matching sheet in `config_2`.
+
+    Sheet-name matching against the memname is case-insensitive (and ignores
+    surrounding whitespace).
+
+    Parameters
+    ----------
+    input_file : str
+        Path to the Excel file containing the "Filing_tabs" sheet that drives
+        the run (memname, titles, version, footnote, etc.).
+    config_1 : str
+        Path to the "before" Excel workbook.
+    config_2 : str
+        Path to the "after" Excel workbook.
+    output_folder : str
+        Folder where the generated PDFs will be written.
+
+    Returns
+    -------
+    dict with keys "strike_pdfs" and "highlight_pdfs", each a list of the
+    generated PDF paths (one per memname processed).
+    """
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    input_df = pd.read_excel(input_file, sheet_name="Filing_tabs")
+    input_df.columns = input_df.columns.str.strip().str.lower()
+
+    strike_pdfs = []
+    highlight_pdfs = []
+
+    for _, row in input_df.iterrows():
+
+        memname = str(row.get("memname", "")).strip()
+        if not memname:
+            continue
+
+        print(f"🚀 Processing: {memname}")
+
+        # Case-insensitive sheet name lookup in both config files
+        sheet_1 = find_sheet_name_ci(config_1, memname)
+        sheet_2 = find_sheet_name_ci(config_2, memname)
+
+        df1 = pd.read_excel(config_1, sheet_name=sheet_1).fillna("")
+        df2 = pd.read_excel(config_2, sheet_name=sheet_2).fillna("")
+
+        df1 = df1.applymap(clean_text)
+        df2 = df2.applymap(clean_text)
+
+        key_cols = get_fixed_columns(df1)
+
+        df1["__key__"] = build_key(df1, key_cols)
+        df2["__key__"] = build_key(df2, key_cols)
+
+        # FAST COMPARISON
+        merged = df1.merge(df2, on="__key__", how="left", suffixes=("_1", "_2"))
+        highlight_flag = pd.DataFrame(False, index=df1.index, columns=df1.columns)
+
+        for col in df1.columns:
+            if col == "__key__":
+                continue
+            highlight_flag[col] = ~(
+                merged[col + "_1"].apply(normalize).fillna("")
+                .eq(merged[col + "_2"].apply(normalize).fillna(""))
+            )
+
+        highlight_flag.loc[~df1["__key__"].isin(df2["__key__"]), :] = True
+
+        # STRIKE
+        df1_lookup = df1.set_index("__key__").to_dict("index")
+        df_strike = df2.copy()
+
+        for col in df2.columns:
+            df_strike[col] = [
+                strike_text(format_value(r[col])) if r["__key__"] not in df1_lookup
+                else safe_para(transform_display(r[col])) if col in key_cols
+                else strike_text(format_value(r[col])) if normalize(r[col]) != normalize(df1_lookup[r["__key__"]].get(col, ""))
+                else safe_para(format_value(r[col]))
+                for _, r in df2.iterrows()
+            ]
+
+        titles = [str(row.get(f"title{i}", "")) for i in range(1, 5)]
+        version = str(row.get("version_current", ""))
+        page_cnt_title = str(row.get("page_cnt_title", ""))
+
+        _, center, right = parse_footnote(str(row.get("footnote1", "")))
+
+        drawer_strike = make_page_drawer(titles, version, center, right, "strike", page_cnt_title)
+        drawer_highlight = make_page_drawer(titles, version, center, right, "highlight", page_cnt_title)
+
+        pdf_strike = os.path.join(output_folder, f"{memname}_strike.pdf")
+        pdf_highlight = os.path.join(output_folder, f"{memname}_highlight.pdf")
+
+        build_pdf(df_strike, None, pdf_strike, False, drawer_strike, key_cols)
+        build_pdf(df1, highlight_flag, pdf_highlight, True, drawer_highlight, key_cols)
+
+        strike_pdfs.append(pdf_strike)
+        highlight_pdfs.append(pdf_highlight)
+
+    print("✅ DONE")
+
+    return {"strike_pdfs": strike_pdfs, "highlight_pdfs": highlight_pdfs}
+
+
+if __name__ == "__main__":
+    # Example usage
+    generate_reports(
+        input_file=r"D:\filling_input_exl\input.xlsx",
+        config_1=r"D:\filling_input_exl\config.xlsx",
+        config_2=r"D:\filling_input_exl\config2.xlsx",
+        output_folder=r"D:\filling_input_exl",
+    )
