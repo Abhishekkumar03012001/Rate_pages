@@ -1,0 +1,8 @@
+from generate_reports import generate_reports
+
+result = generate_reports(
+    input_file=r"D:\filling_input_exl\input.xlsx",
+    config_1=r"D:\filling_input_exl\config.xlsx",
+    config_2=r"D:\filling_input_exl\config2.xlsx",
+    output_folder=r"D:\filling_input_exl",
+)
