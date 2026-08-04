@@ -1,8 +1,16 @@
-from generate_reports import generate_reports
-
-result = generate_reports(
-    input_file=r"D:\filling_input_exl\input.xlsx",
-    config_1=r"D:\filling_input_exl\config.xlsx",
-    config_2=r"D:\filling_input_exl\config2.xlsx",
-    output_folder=r"D:\filling_input_exl",
-)
+for col in df2.columns:
+            if col in key_cols:
+                df_strike[col] = [
+                    strike_text(transform_display(r[col])) if r["__key__"] not in df1_lookup
+                    else safe_para(transform_display(r[col]))
+                    for _, r in df2.iterrows()
+                ]
+            else:
+                df_strike[col] = [
+                    strike_text(format_value(r[col])) if (
+                        r["__key__"] not in df1_lookup
+                        or normalize(r[col]) != normalize(df1_lookup[r["__key__"]].get(col, ""))
+                    )
+                    else safe_para(format_value(r[col]))
+                    for _, r in df2.iterrows()
+                ]
