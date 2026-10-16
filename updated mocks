@@ -65,7 +65,7 @@ def transform_display(val):
     try:
         float_val = float(val)
         int_val = int(float(val))
-        if int_val < 10:
+        if int_val < 1:
             return "No Information"
         if str(int_val).startswith("999") and len(str(int_val)) >= 3:
             numd = len(str(int_val))
@@ -122,6 +122,19 @@ def parse_footnote(text):
     text = str(text).replace("\xa0", " ")
     return _grab(text, "left"), _grab(text, "center"), _grab(text, "right")
 # --------------------------------------------------------------------------
+
+
+_DATE_RE = re.compile(r"\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4}")
+
+
+def date_from_footnote(footnote_raw):
+    """
+    The ONLY source of the footer date: the footnote1 cell.
+    Looks for a date (e.g. 11/19/2016) anywhere in the footnote text and
+    returns it as mm/dd/yyyy. Returns '' if footnote1 has no date.
+    """
+    m = _DATE_RE.search(str(footnote_raw or ""))
+    return format_date(m.group(0)) if m else ""
 
 
 def get_fixed_columns(df):
@@ -419,11 +432,15 @@ def mock_generator_main(input_file, config_1, config_2, output_folder, is_merge)
             strike_flags = compare_frames(df2, df1, key_cols)      # rows of CURRENT
 
             titles = [safe_str(row.get(f"title{i}", "")) for i in range(1, 5)]
-            version = safe_str(row.get("version_current", ""))
             page_cnt_title = safe_str(row.get("page_cnt_title", ""))
             footnote_raw = safe_str(row.get("footnote1", ""))
             _, center, right = parse_footnote(footnote_raw)
-            print(f"  footer center = {center!r} | footer right = {right!r}")
+
+            # footer date (bottom-left) comes ONLY from footnote1
+            version = date_from_footnote(footnote_raw)
+            if not version:
+                print("  WARNING: no date found in footnote1 - left footer will be empty")
+            print(f"  footer left(date) = {version!r} | center = {center!r} | right = {right!r}")
 
             drawer_strike = make_page_drawer(titles, version, center, right, "strike", page_cnt_title)
             drawer_highlight = make_page_drawer(titles, version, center, right, "highlight", page_cnt_title)
