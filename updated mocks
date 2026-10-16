@@ -1,0 +1,480 @@
+import os
+import re
+import html
+import traceback
+
+import numpy as np
+import pandas as pd
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    BaseDocTemplate, PageTemplate, Frame, Table, TableStyle, PageBreak, Paragraph
+)
+
+# pypdf is the maintained library; fall back to PyPDF2 if that is what is installed
+try:
+    from pypdf import PdfWriter as PdfMerger
+except ImportError:
+    from PyPDF2 import PdfMerger
+
+
+# ----------------------------------------------------------------------------
+# SETTINGS
+# ----------------------------------------------------------------------------
+MAX_COLS = 8                      # max columns on one PDF page (fixed + scrolling columns)
+PAGE_MARGINS = dict(left=40, right=40, top=80, bottom=55)
+SAFETY = 6                        # spare points kept at the bottom of every page
+
+# False -> a cell is highlighted/struck when the underlying value differs at all
+# True  -> only when the value printed in the PDF (4 decimals) differs
+COMPARE_DISPLAYED_VALUES = False
+
+
+# ----------------------------------------------------------------------------
+# GENERIC HELPERS
+# ----------------------------------------------------------------------------
+def safe_str(v):
+    """str() that turns NaN/None into '' (so 'nan' never gets printed)."""
+    if v is None:
+        return ""
+    if not isinstance(v, str) and pd.isna(v):
+        return ""
+    return str(v).strip()
+
+
+def df_map(df, func):
+    """DataFrame.map exists only in pandas >= 2.1; applymap works on older ones."""
+    return df.map(func) if hasattr(df, "map") else df.applymap(func)
+
+
+def clean_text(x):
+    if not isinstance(x, str) and pd.isna(x):
+        return ""
+    return " ".join(str(x).strip().lower().split())
+
+
+def normalize(val):
+    """Makes '5', '5.0', 5 and 5.00 compare equal; text is compared case-insensitively."""
+    if not isinstance(val, str) and pd.isna(val):
+        return ""
+    if val == "":
+        return ""
+    try:
+        return str(float(val)).rstrip("0").rstrip(".")
+    except Exception:
+        return str(val).strip().lower()
+
+
+def format_value(val):
+    try:
+        return f"{float(val):.4f}"
+    except Exception:
+        return str(val)
+
+
+def transform_display(val):
+    try:
+        float_val = float(val)
+        int_val = int(float(val))
+        if int_val < 10:
+            return "No Information"
+        if str(int_val).startswith("999") and len(str(int_val)) >= 3:
+            numd = len(str(int_val))
+            return ">" + "1" + "0" * numd
+        if str(float_val).startswith("9.99"):
+            return ">" + "1" + "0"
+        if str(float_val).startswith("99.9"):
+            return ">" + "1" + "00"
+
+        s = str(val).strip()
+
+        if "e" in s.lower():
+            formatted = f"{float_val:.6f}".rstrip("0")
+            if "." in formatted:
+                deci = len(formatted.split(".")[1])
+                places = min(deci, 4)
+                return f"{float_val:.{places}f}"
+            return formatted
+
+        if "." not in s:
+            return str(int_val)
+
+        return f"{float_val:.4f}"
+    except Exception:
+        return str(val)
+
+
+def cell_text(val, is_fixed):
+    return transform_display(val) if is_fixed else format_value(val)
+
+
+def format_date(val):
+    try:
+        return pd.to_datetime(val).strftime("%m/%d/%Y")
+    except Exception:
+        return str(val)
+
+
+def parse_footnote(text):
+    left = re.search(r'left\s*"([^"]*)"', text)
+    center = re.search(r'center\s*"([^"]*)"', text)
+    right = re.search(r'right\s*"([^"]*)"', text)
+    return (
+        left.group(1).strip() if left else "",
+        center.group(1).strip() if center else "",
+        right.group(1).strip() if right else "",
+    )
+
+
+# ----------------------------------------------------------------------------
+# LOADING + COMPARING
+# ----------------------------------------------------------------------------
+def get_fixed_columns(df):
+    """Columns that stay on every page = everything before the first fire/risk/rate column."""
+    for i, col in enumerate(df.columns):
+        if str(col).strip().lower() in ("fire", "risk", "rate"):
+            return list(df.columns[:i]) or [df.columns[0]]
+    return [df.columns[0]]
+
+
+def find_sheet(xl, name):
+    if name in xl.sheet_names:
+        return name
+    lookup = {n.strip().lower(): n for n in xl.sheet_names}
+    return lookup.get(name.strip().lower())
+
+
+def load_sheet(xl, sheet_name):
+    df = xl.parse(sheet_name)
+    df = df.dropna(how="all").reset_index(drop=True)        # drop fully blank rows
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.fillna("")
+    df = df_map(df, lambda v: v.strip() if isinstance(v, str) else v)
+    return df
+
+
+def build_key(df_clean, cols):
+    """
+    Row key built from the fixed columns.
+    A running counter is appended so duplicate keys stay unique and line up in order.
+    This is what stops rows/highlights from getting shifted.
+    """
+    base = df_clean[cols].apply(
+        lambda r: "|".join(normalize(clean_text(v)) for v in r), axis=1
+    )
+    return base + "#" + base.groupby(base).cumcount().astype(str)
+
+
+def same(a, b):
+    if COMPARE_DISPLAYED_VALUES:
+        return format_value(a) == format_value(b)
+    return normalize(a) == normalize(b)
+
+
+def compare_frames(df_a, df_b, key_cols):
+    """
+    Returns a bool array shaped like df_a.
+    True  = this cell of df_a is new / different compared with df_b.
+    A row that does not exist in df_b is True for the whole row.
+    """
+    ca = df_map(df_a, clean_text)
+    cb = df_map(df_b, clean_text)
+    keys_a = build_key(ca, key_cols)
+    keys_b = build_key(cb, key_cols)
+
+    lookup_b = dict(zip(keys_b, cb.to_dict("records")))
+    cols = list(df_a.columns)
+    flags = np.zeros((len(df_a), len(cols)), dtype=bool)
+
+    for i, (k, rec) in enumerate(zip(keys_a, ca.to_dict("records"))):
+        other = lookup_b.get(k)
+        if other is None:
+            flags[i, :] = True
+            continue
+        for j, c in enumerate(cols):
+            if c in key_cols:
+                continue
+            flags[i, j] = not same(rec[c], other.get(c, ""))
+    return flags
+
+
+# ----------------------------------------------------------------------------
+# PAGE HEADER / FOOTER
+# ----------------------------------------------------------------------------
+def make_page_drawer(titles, version_text, footer_center, footer_right, mode, page_cnt_title):
+    width, height = letter
+    page_counter = {"count": 0}
+
+    def draw_page(canvas, doc):
+        page_counter["count"] += 1
+        canvas.setFont("Helvetica-Bold", 10)
+        y = height - 30
+        for t in titles:
+            if t:
+                canvas.drawCentredString(width / 2, y, str(t))
+                y -= 13
+
+        canvas.setFont("Helvetica", 8)
+        text = format_date(version_text) if version_text else ""
+
+        if mode == "strike":
+            canvas.setFillColor(colors.red)
+            canvas.drawString(40, 35, text)
+            canvas.line(40, 38, 40 + canvas.stringWidth(text, "Helvetica", 8), 38)
+            canvas.setFillColor(colors.black)
+        elif mode == "highlight":
+            canvas.setFillColor(colors.yellow)
+            canvas.rect(39, 33, canvas.stringWidth(text, "Helvetica", 8) + 4, 10, fill=1, stroke=0)
+            canvas.setFillColor(colors.black)
+            canvas.drawString(40, 35, text)
+        else:
+            canvas.drawString(40, 35, text)
+
+        canvas.setFillColor(colors.black)
+        canvas.drawCentredString(width / 2, 35, footer_center or "")
+        canvas.drawRightString(width - 40, 35, footer_right or "")
+        canvas.drawRightString(width - 40, 20, f"{page_cnt_title}{page_counter['count']}")
+
+    return draw_page
+
+
+# ----------------------------------------------------------------------------
+# PDF BUILDER
+# ----------------------------------------------------------------------------
+def build_pdf(df, flags, path, mode, drawer, key_cols, header_style, normal_style):
+    """
+    mode = "highlight": cells where flags is True get a yellow background
+    mode = "strike"   : cells where flags is True are printed red + struck through
+    Every column of df is printed. Wide sheets are split over several pages
+    (fixed columns repeat on each page). Rows are packed so that a page is
+    filled completely and never spills onto an extra page.
+    """
+    cols = list(df.columns)
+    n_rows = len(df)
+    pos = {c: i for i, c in enumerate(cols)}
+
+    fixed = [c for c in key_cols if c in pos]
+    rest = [c for c in cols if c not in fixed]
+
+    # ---- column chunks: nothing is dropped, even if fixed columns >= MAX_COLS
+    step = max(1, MAX_COLS - len(fixed))
+    chunks = [fixed + rest[i:i + step] for i in range(0, len(rest), step)] or [fixed]
+
+    # ---- final text for every cell
+    text = {c: [cell_text(v, c in fixed) for v in df[c]] for c in cols}
+
+    # ---- page geometry (frame has zero padding so widths/heights are exact)
+    page_w, page_h = letter
+    m = PAGE_MARGINS
+    frame_w = page_w - m["left"] - m["right"]
+    frame_h = page_h - m["top"] - m["bottom"]
+    usable_h = frame_h - SAFETY
+    PAD_H, PAD_V = 4, 2           # same values as the TableStyle below
+
+    def col_widths(n):
+        return [70] * n if n < 5 else [frame_w / n] * n
+
+    def make_cell(i, c):
+        t = html.escape(text[c][i], quote=False)
+        if t and mode == "strike" and flags[i, pos[c]]:
+            t = f'<font color="red"><strike>{t}</strike></font>'
+        return Paragraph(t or "&nbsp;", normal_style)
+
+    def make_header(c):
+        return Paragraph(f"<b>{html.escape(str(c), quote=False)}</b>", header_style)
+
+    def para_h(p, w):
+        return p.wrap(w - 2 * PAD_H, 10000)[1]
+
+    # ---- measure every row once (per column chunk)
+    chunk_info = []
+    for chunk in chunks:
+        widths = col_widths(len(chunk))
+        hdr_h = max(para_h(make_header(c), w) for c, w in zip(chunk, widths)) + 2 * PAD_V
+        row_hs = [
+            max(para_h(make_cell(i, c), w) for c, w in zip(chunk, widths)) + 2 * PAD_V
+            for i in range(n_rows)
+        ]
+        chunk_info.append((widths, hdr_h, row_hs))
+
+    def fit_end(row_start):
+        """Last row (exclusive) that fits on the page for ALL column chunks."""
+        end = n_rows
+        for widths, hdr_h, row_hs in chunk_info:
+            total, e = hdr_h, row_start
+            while e < n_rows and total + row_hs[e] <= usable_h:
+                total += row_hs[e]
+                e += 1
+            end = min(end, e)
+        return max(end, row_start + 1)          # always make progress
+
+    def make_table(chunk, widths, r0, r1):
+        data = [[make_header(c) for c in chunk]]
+        for i in range(r0, r1):
+            data.append([make_cell(i, c) for c in chunk])
+
+        t = Table(data, colWidths=widths, hAlign="LEFT")
+        style = [
+            ("GRID", (0, 0), (-1, -1), 1.2, colors.black),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), PAD_V),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), PAD_V),
+            ("LEFTPADDING", (0, 0), (-1, -1), PAD_H),
+            ("RIGHTPADDING", (0, 0), (-1, -1), PAD_H),
+        ]
+        if mode == "highlight":
+            for i in range(r0, r1):
+                for ci, c in enumerate(chunk):
+                    if flags[i, pos[c]]:
+                        style.append(("BACKGROUND", (ci, i - r0 + 1), (ci, i - r0 + 1), colors.yellow))
+        t.setStyle(TableStyle(style))
+        return t
+
+    # ---- assemble pages
+    elements = []
+    row_start = 0
+    while row_start < n_rows:
+        row_end = fit_end(row_start)
+
+        # safety net: check the REAL table height and shrink if it is ever too tall
+        while True:
+            tables = [make_table(ch, w, row_start, row_end) for ch, (w, _, _) in zip(chunks, chunk_info)]
+            too_tall = any(t.wrap(frame_w, 10000)[1] > usable_h for t in tables)
+            if not too_tall or row_end - row_start <= 1:
+                break
+            row_end -= 1
+
+        for t in tables:
+            if elements:
+                elements.append(PageBreak())
+            elements.append(t)
+        row_start = row_end
+
+    doc = BaseDocTemplate(
+        path, pagesize=letter,
+        leftMargin=m["left"], rightMargin=m["right"],
+        topMargin=m["top"], bottomMargin=m["bottom"],
+        pageCompression=1,
+    )
+    frame = Frame(m["left"], m["bottom"], frame_w, frame_h,
+                  leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0, id="main")
+    doc.addPageTemplates([PageTemplate(id="main", frames=[frame], onPage=drawer)])
+    doc.build(elements)
+
+
+# ----------------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------------
+def merge_pdfs(pdf_list, out_path):
+    if not pdf_list:
+        return
+    merger = PdfMerger()
+    for pdf in pdf_list:
+        merger.append(pdf)
+    merger.write(out_path)
+    merger.close()
+
+
+def mock_generator_main(input_file, config_1, config_2, output_folder, is_merge):
+    """
+    config_1 = PROPOSED repository  -> highlight PDF (changed cells in yellow)
+    config_2 = CURRENT  repository  -> strike PDF    (removed/changed cells in red + strike)
+    """
+    os.makedirs(output_folder, exist_ok=True)
+
+    styles = getSampleStyleSheet()
+    normal_style = ParagraphStyle(name="NormalSmall", parent=styles["Normal"],
+                                  fontSize=8, leading=9, alignment=1)
+    header_style = ParagraphStyle(name="HeaderSmall", parent=styles["Normal"],
+                                  fontSize=7, leading=8, alignment=1, textColor=colors.black)
+
+    input_df = pd.read_excel(input_file, sheet_name="Filing_tabs")
+    input_df.columns = input_df.columns.str.strip().str.lower()
+
+    xl1 = pd.ExcelFile(config_1)
+    xl2 = pd.ExcelFile(config_2)
+
+    strike_pdfs, highlight_pdfs = [], []
+
+    for _, row in input_df.iterrows():
+        check1 = safe_str(row.get("table_include", ""))
+        check2 = safe_str(row.get("exclude_mock", ""))
+        if check1.lower() == "no" or check2.lower() == "yes":
+            continue
+
+        memname = safe_str(row.get("memname", ""))
+        if not memname:
+            continue
+        tab_id = safe_str(row.get("srt_tab_id", ""))
+        print(f"\nProcessing -> {tab_id} : {memname}")
+
+        sheet1 = find_sheet(xl1, memname)
+        if sheet1 is None:
+            print(f"Sheet '{memname}' not found in {os.path.basename(config_1)} - Skipping")
+            continue
+        sheet2 = find_sheet(xl2, memname)
+        if sheet2 is None:
+            print(f"Sheet '{memname}' not found in {os.path.basename(config_2)} - Skipping")
+            continue
+
+        try:
+            df1 = load_sheet(xl1, sheet1)     # proposed
+            df2 = load_sheet(xl2, sheet2)     # current
+
+            if df1.empty or df2.empty:
+                print(f"'{memname}' has no data rows in one of the files - Skipping")
+                continue
+
+            key_cols = get_fixed_columns(df1)
+            missing = [c for c in key_cols if c not in df2.columns]
+            if missing:
+                print(f"'{memname}': key column(s) {missing} missing in current file - Skipping")
+                continue
+
+            # which cells differ?
+            highlight_flags = compare_frames(df1, df2, key_cols)   # rows of PROPOSED
+            strike_flags = compare_frames(df2, df1, key_cols)      # rows of CURRENT
+
+            titles = [safe_str(row.get(f"title{i}", "")) for i in range(1, 5)]
+            version = safe_str(row.get("version_current", ""))
+            page_cnt_title = safe_str(row.get("page_cnt_title", ""))
+            _, center, right = parse_footnote(safe_str(row.get("footnote1", "")))
+
+            drawer_strike = make_page_drawer(titles, version, center, right, "strike", page_cnt_title)
+            drawer_highlight = make_page_drawer(titles, version, center, right, "highlight", page_cnt_title)
+
+            safe_name = re.sub(r'[\\/:*?"<>|]', "_", memname)
+            pdf_strike = os.path.join(output_folder, f"{safe_name}_strike.pdf")
+            pdf_highlight = os.path.join(output_folder, f"{safe_name}_highlight.pdf")
+
+            build_pdf(df2, strike_flags, pdf_strike, "strike", drawer_strike,
+                      key_cols, header_style, normal_style)
+            build_pdf(df1, highlight_flags, pdf_highlight, "highlight", drawer_highlight,
+                      key_cols, header_style, normal_style)
+
+            strike_pdfs.append(pdf_strike)
+            highlight_pdfs.append(pdf_highlight)
+            print(f"Completed: {memname}")
+
+        except Exception:
+            print(f"ERROR while processing '{memname}':")
+            traceback.print_exc()
+            continue
+
+    if is_merge:
+        print("\nMerging PDFs ...")
+        merge_pdfs(strike_pdfs, os.path.join(output_folder, "Final_Rate_Page_Strike.pdf"))
+        merge_pdfs(highlight_pdfs, os.path.join(output_folder, "Final_Rate_Page_Highlight.pdf"))
+
+    print("\nDONE")
+
+
+if __name__ == "__main__":
+    input_file = r"Rate_Input.xlsx"
+    config_1 = r"Rate_Repository_Proposed.xlsx"
+    config_2 = r"Rate_Repository_Current.xlsx"
+    output_folder = r"C:\Users\arushi198551\Downloads\mock"
+    is_merge = True
+
+    mock_generator_main(input_file, config_1, config_2, output_folder, is_merge)
