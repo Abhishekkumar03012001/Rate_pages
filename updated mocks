@@ -12,28 +12,18 @@ from reportlab.platypus import (
     BaseDocTemplate, PageTemplate, Frame, Table, TableStyle, PageBreak, Paragraph
 )
 
-# pypdf is the maintained library; fall back to PyPDF2 if that is what is installed
 try:
     from pypdf import PdfWriter as PdfMerger
 except ImportError:
     from PyPDF2 import PdfMerger
 
 
-# ----------------------------------------------------------------------------
-# SETTINGS
-# ----------------------------------------------------------------------------
-MAX_COLS = 8                      # max columns on one PDF page (fixed + scrolling columns)
+MAX_COLS = 8                     
 PAGE_MARGINS = dict(left=40, right=40, top=80, bottom=55)
-SAFETY = 6                        # spare points kept at the bottom of every page
+SAFETY = 6                     
 
-# False -> a cell is highlighted/struck when the underlying value differs at all
-# True  -> only when the value printed in the PDF (4 decimals) differs
 COMPARE_DISPLAYED_VALUES = False
 
-
-# ----------------------------------------------------------------------------
-# GENERIC HELPERS
-# ----------------------------------------------------------------------------
 def safe_str(v):
     """str() that turns NaN/None into '' (so 'nan' never gets printed)."""
     if v is None:
@@ -127,9 +117,6 @@ def parse_footnote(text):
     )
 
 
-# ----------------------------------------------------------------------------
-# LOADING + COMPARING
-# ----------------------------------------------------------------------------
 def get_fixed_columns(df):
     """Columns that stay on every page = everything before the first fire/risk/rate column."""
     for i, col in enumerate(df.columns):
@@ -199,9 +186,6 @@ def compare_frames(df_a, df_b, key_cols):
     return flags
 
 
-# ----------------------------------------------------------------------------
-# PAGE HEADER / FOOTER
-# ----------------------------------------------------------------------------
 def make_page_drawer(titles, version_text, footer_center, footer_right, mode, page_cnt_title):
     width, height = letter
     page_counter = {"count": 0}
@@ -239,9 +223,6 @@ def make_page_drawer(titles, version_text, footer_center, footer_right, mode, pa
     return draw_page
 
 
-# ----------------------------------------------------------------------------
-# PDF BUILDER
-# ----------------------------------------------------------------------------
 def build_pdf(df, flags, path, mode, drawer, key_cols, header_style, normal_style):
     """
     mode = "highlight": cells where flags is True get a yellow background
@@ -257,20 +238,17 @@ def build_pdf(df, flags, path, mode, drawer, key_cols, header_style, normal_styl
     fixed = [c for c in key_cols if c in pos]
     rest = [c for c in cols if c not in fixed]
 
-    # ---- column chunks: nothing is dropped, even if fixed columns >= MAX_COLS
     step = max(1, MAX_COLS - len(fixed))
     chunks = [fixed + rest[i:i + step] for i in range(0, len(rest), step)] or [fixed]
 
-    # ---- final text for every cell
     text = {c: [cell_text(v, c in fixed) for v in df[c]] for c in cols}
 
-    # ---- page geometry (frame has zero padding so widths/heights are exact)
     page_w, page_h = letter
     m = PAGE_MARGINS
     frame_w = page_w - m["left"] - m["right"]
     frame_h = page_h - m["top"] - m["bottom"]
     usable_h = frame_h - SAFETY
-    PAD_H, PAD_V = 4, 2           # same values as the TableStyle below
+    PAD_H, PAD_V = 4, 2           
 
     def col_widths(n):
         return [70] * n if n < 5 else [frame_w / n] * n
@@ -287,7 +265,6 @@ def build_pdf(df, flags, path, mode, drawer, key_cols, header_style, normal_styl
     def para_h(p, w):
         return p.wrap(w - 2 * PAD_H, 10000)[1]
 
-    # ---- measure every row once (per column chunk)
     chunk_info = []
     for chunk in chunks:
         widths = col_widths(len(chunk))
@@ -307,7 +284,7 @@ def build_pdf(df, flags, path, mode, drawer, key_cols, header_style, normal_styl
                 total += row_hs[e]
                 e += 1
             end = min(end, e)
-        return max(end, row_start + 1)          # always make progress
+        return max(end, row_start + 1)       
 
     def make_table(chunk, widths, r0, r1):
         data = [[make_header(c) for c in chunk]]
@@ -331,13 +308,11 @@ def build_pdf(df, flags, path, mode, drawer, key_cols, header_style, normal_styl
         t.setStyle(TableStyle(style))
         return t
 
-    # ---- assemble pages
     elements = []
     row_start = 0
     while row_start < n_rows:
         row_end = fit_end(row_start)
 
-        # safety net: check the REAL table height and shrink if it is ever too tall
         while True:
             tables = [make_table(ch, w, row_start, row_end) for ch, (w, _, _) in zip(chunks, chunk_info)]
             too_tall = any(t.wrap(frame_w, 10000)[1] > usable_h for t in tables)
@@ -363,9 +338,6 @@ def build_pdf(df, flags, path, mode, drawer, key_cols, header_style, normal_styl
     doc.build(elements)
 
 
-# ----------------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------------
 def merge_pdfs(pdf_list, out_path):
     if not pdf_list:
         return
@@ -470,11 +442,12 @@ def mock_generator_main(input_file, config_1, config_2, output_folder, is_merge)
     print("\nDONE")
 
 
-if __name__ == "__main__":
-    input_file = r"Rate_Input.xlsx"
-    config_1 = r"Rate_Repository_Proposed.xlsx"
-    config_2 = r"Rate_Repository_Current.xlsx"
-    output_folder = r"C:\Users\arushi198551\Downloads\mock"
-    is_merge = True
 
-    mock_generator_main(input_file, config_1, config_2, output_folder, is_merge)
+input_file = r"Rate_Input.xlsx"
+config_1 = r"Rate_Repository_Proposed.xlsx"
+config_2 = r"Rate_Repository_Current.xlsx"
+output_folder = r"C:\Users\arushi198551\Downloads\mock"
+is_merge = True
+
+mock_generator_main(input_file, config_1, config_2, output_folder, is_merge)
+
