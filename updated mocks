@@ -34,8 +34,8 @@ def safe_str(v):
 
 
 def df_map(df, func):
-    """DataFrame.map exists only in pandas >= 2.1; applymap works on older ones."""
-    return df.map(func) if hasattr(df, "map") else df.applymap(func)
+    """Apply func to every cell. Works on any pandas version."""
+    return df.apply(lambda col: col.map(func))
 
 
 def clean_text(x):
@@ -442,12 +442,10 @@ def mock_generator_main(input_file, config_1, config_2, output_folder, is_merge)
     print("\nDONE")
 
 
-
-input_file = r"Rate_Input.xlsx"
-config_1 = r"Rate_Repository_Proposed.xlsx"
-config_2 = r"Rate_Repository_Current.xlsx"
-output_folder = r"C:\Users\arushi198551\Downloads\mock"
+input_file = r"D:\filling_input_exl\input.xlsx"
+config_1 = r"D:\filling_input_exl\config.xlsx"
+config_2 = r"D:\filling_input_exl\config2.xlsx"
+output_folder = r"D:\filling_input_exl"
 is_merge = True
 
 mock_generator_main(input_file, config_1, config_2, output_folder, is_merge)
-
