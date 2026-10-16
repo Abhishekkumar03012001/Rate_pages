@@ -32,9 +32,7 @@ def safe_str(v):
         return ""
     return str(v).strip()
 
-
 def df_map(df, func):
-    """Apply func to every cell. Works on any pandas version."""
     return df.apply(lambda col: col.map(func))
 
 
@@ -440,6 +438,7 @@ def mock_generator_main(input_file, config_1, config_2, output_folder, is_merge)
         merge_pdfs(highlight_pdfs, os.path.join(output_folder, "Final_Rate_Page_Highlight.pdf"))
 
     print("\nDONE")
+
 
 
 input_file = r"D:\filling_input_exl\input.xlsx"
