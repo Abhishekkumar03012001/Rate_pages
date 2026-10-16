@@ -104,15 +104,24 @@ def format_date(val):
         return str(val)
 
 
-def parse_footnote(text):
-    left = re.search(r'left\s*"([^"]*)"', text)
-    center = re.search(r'center\s*"([^"]*)"', text)
-    right = re.search(r'right\s*"([^"]*)"', text)
-    return (
-        left.group(1).strip() if left else "",
-        center.group(1).strip() if center else "",
-        right.group(1).strip() if right else "",
+# ---- CENTER FOOTER FIX: tolerant footnote parser -------------------------
+# Accepts straight quotes and Excel "smart" quotes, any letter case,
+# optional ':' or '=' after the keyword, and non-breaking spaces.
+_Q = '"\u201c\u201d\u201e\u201f\u2033'
+
+def _grab(text, label):
+    m = re.search(
+        rf'{label}\s*[:=]?\s*[{_Q}]([^{_Q}]*)[{_Q}]',
+        text,
+        flags=re.IGNORECASE,
     )
+    return m.group(1).strip() if m else ""
+
+
+def parse_footnote(text):
+    text = str(text).replace("\xa0", " ")
+    return _grab(text, "left"), _grab(text, "center"), _grab(text, "right")
+# --------------------------------------------------------------------------
 
 
 def get_fixed_columns(df):
@@ -213,7 +222,10 @@ def make_page_drawer(titles, version_text, footer_center, footer_right, mode, pa
         else:
             canvas.drawString(40, 35, text)
 
+        # reset state explicitly so the footer text is always drawn in black Helvetica 8
         canvas.setFillColor(colors.black)
+        canvas.setStrokeColor(colors.black)
+        canvas.setFont("Helvetica", 8)
         canvas.drawCentredString(width / 2, 35, footer_center or "")
         canvas.drawRightString(width - 40, 35, footer_right or "")
         canvas.drawRightString(width - 40, 20, f"{page_cnt_title}{page_counter['count']}")
@@ -409,7 +421,9 @@ def mock_generator_main(input_file, config_1, config_2, output_folder, is_merge)
             titles = [safe_str(row.get(f"title{i}", "")) for i in range(1, 5)]
             version = safe_str(row.get("version_current", ""))
             page_cnt_title = safe_str(row.get("page_cnt_title", ""))
-            _, center, right = parse_footnote(safe_str(row.get("footnote1", "")))
+            footnote_raw = safe_str(row.get("footnote1", ""))
+            _, center, right = parse_footnote(footnote_raw)
+            print(f"  footer center = {center!r} | footer right = {right!r}")
 
             drawer_strike = make_page_drawer(titles, version, center, right, "strike", page_cnt_title)
             drawer_highlight = make_page_drawer(titles, version, center, right, "highlight", page_cnt_title)
