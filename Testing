@@ -1,16 +1,7 @@
-for col in df2.columns:
-            if col in key_cols:
-                df_strike[col] = [
-                    strike_text(transform_display(r[col])) if r["__key__"] not in df1_lookup
-                    else safe_para(transform_display(r[col]))
-                    for _, r in df2.iterrows()
-                ]
-            else:
-                df_strike[col] = [
-                    strike_text(format_value(r[col])) if (
-                        r["__key__"] not in df1_lookup
-                        or normalize(r[col]) != normalize(df1_lookup[r["__key__"]].get(col, ""))
-                    )
-                    else safe_para(format_value(r[col]))
-                    for _, r in df2.iterrows()
-                ]
+Applies To: Homeowner Tiering Manual, T-1 to T-8 (Rate)
+Comments: Please provide some clarification on the Roof Appearance Score tables. The even page numbers all show a factor of 1.000, while the odd pages, for the same scores, show difference in the factor used. Please explain.
+The odd-numbered pages continue the table from page one. There are too many peril columns to fit on one page, so the content has been split across multiple pages due to formatting constraints.
+Applies To:
+KY Homeowner Product Guide, Pages 2 and 5 (Rate)
+Please explain how American Economy Insurance Company will determine building footprint area, roof appearance, roof shape, structure count in the area, and tree overhang.
+The variables are derived from third party data.
