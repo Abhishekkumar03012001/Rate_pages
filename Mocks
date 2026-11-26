@@ -21,6 +21,16 @@
 
 proc python;
 submit;
+# ---------- diagnostics: shows which Python is used and what is missing ----------
+import sys, importlib.util, traceback
+print("Python executable:", sys.executable)
+print("Python version   :", sys.version.split()[0])
+_missing = [m for m in ["pandas", "openpyxl", "reportlab", "pypdf"] if importlib.util.find_spec(m) is None]
+if _missing:
+    print("MISSING PYTHON PACKAGES:", _missing)
+    raise ImportError("Install these packages for the Python above: " + ", ".join(_missing))
+print("All required packages found.")
+
 import pandas as pd
 import os
 import re
@@ -511,13 +521,18 @@ def generate_single_reports(input_file, config_file, output_folder,
     return all_pdfs
 
 
-generate_single_reports(
-    input_file=SAS.symget("input_file"),
-    config_file=SAS.symget("config_file"),
-    output_folder=SAS.symget("output_folder"),   # "Proffs" folder is created inside this
-    pdf_names=PDF_NAMES,
-    max_size_mb=MAX_PDF_SIZE_MB,
-)
+try:
+    generate_single_reports(
+        input_file=SAS.symget("input_file"),
+        config_file=SAS.symget("config_file"),
+        output_folder=SAS.symget("output_folder"),   # "Proffs" folder is created inside this
+        pdf_names=PDF_NAMES,
+        max_size_mb=MAX_PDF_SIZE_MB,
+    )
+except Exception:
+    print("ERROR DETAILS:")
+    print(traceback.format_exc())
+    raise
 
 endsubmit;
 run;
