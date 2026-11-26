@@ -1,6 +1,35 @@
+/*====================================================================
+  Fire and water PDF report generator  -  SAS Viya version
+  Runs the Python report code through PROC PYTHON.
+
+  BEFORE RUNNING
+  1. Change the 5 %LET values below (paths are SERVER paths, Linux style,
+     not D:\ ; upload input.xlsx and config2.xlsx to the server first).
+  2. The Python on the Viya compute server needs these packages:
+       pandas, openpyxl, reportlab, pypdf
+  3. PROC PYTHON must be configured by your admin (MAS_PYPATH / MAS_M2PATH).
+
+  OUTPUT (same as the Python script): <output_folder>/Proffs/
+       "<pdf_names> page N of M.pdf"  files  +  PDF_Mapping.xlsx
+====================================================================*/
+
+%let input_file    = /your/server/path/input.xlsx;
+%let config_file   = /your/server/path/config2.xlsx;
+%let output_folder = /your/server/path/output;
+%let pdf_names     = Fire and water;
+%let max_size_mb   = 3;
+
+proc python;
+submit;
 import pandas as pd
 import os
 import re
+import io
+import shutil
+import tempfile
+from pypdf import PdfReader, PdfWriter
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, PageBreak, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -12,15 +41,23 @@ header_style = ParagraphStyle(name="HeaderSmall", parent=styles["Normal"], fontS
 
 width, height = letter
 
+# =====================================================================
+# USER SETTINGS
+# =====================================================================
+# Base name for ALL final PDFs. Files are numbered continuously across all
+# groups, e.g. "Fire and water page 1 of 6.pdf" ... "Fire and water page 6 of 6.pdf"
+PDF_NAMES = SAS.symget("pdf_names")
+
+MAX_PDF_SIZE_MB = float(SAS.symget("max_size_mb"))
+OUTPUT_SUBFOLDER = "Proffs"
+MAPPING_EXCEL_NAME = "PDF_Mapping.xlsx"
+
+
 # ===== HELPERS =====
 def clean_text(x):
     if pd.isna(x):
         return ""
     return " ".join(str(x).strip().lower().split())
-
-
-def build_key(df, cols):
-    return df[cols].apply(lambda r: "|".join(clean_text(v) for v in r), axis=1)
 
 
 def get_fixed_columns(df):
@@ -51,27 +88,16 @@ def transform_display(val):
 
 def format_date(val):
     try:
-        return pd.to_datetime(val).strftime("%m/%d/%Y")
+        d = pd.to_datetime(val)
+        return f"{d.month:02d}/{d.day:02d}/{d.year}"
     except:
         return str(val)
 
 
-def normalize(val):
-    if pd.isna(val) or val == "":
-        return ""
-    try:
-        return str(float(val)).rstrip('0').rstrip('.')
-    except:
-        return str(val).strip().lower()
-
-
 def safe_para(val):
-    val = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    AMP = chr(38)
+    val = str(val).replace(AMP, AMP + "amp;").replace("<", AMP + "lt;").replace(">", AMP + "gt;")
     return Paragraph(val, normal_style)
-
-
-def strike_text(val):
-    return Paragraph(f'<font color="red"><strike>{val}</strike></font>', normal_style)
 
 
 def header_para(text):
@@ -79,20 +105,20 @@ def header_para(text):
 
 
 def parse_footnote(text):
-    left = re.search(r'left\s*"([^"]*)"', text)
+    left   = re.search(r'left\s*"([^"]*)"',   text)
     center = re.search(r'center\s*"([^"]*)"', text)
-    right = re.search(r'right\s*"([^"]*)"', text)
+    right  = re.search(r'right\s*"([^"]*)"',  text)
     return (
-        left.group(1).strip() if left else "",
+        left.group(1).strip()   if left   else "",
         center.group(1).strip() if center else "",
-        right.group(1).strip() if right else ""
+        right.group(1).strip()  if right  else ""
     )
 
 
 def find_sheet_name_ci(excel_path, target_name):
     """
     Return the actual sheet name inside excel_path that matches target_name
-    case-insensitively (and with surrounding whitespace ignored).
+    case-insensitively (and ignoring surrounding whitespace).
     Raises ValueError if no match is found.
     """
     xl = pd.ExcelFile(excel_path)
@@ -106,8 +132,27 @@ def find_sheet_name_ci(excel_path, target_name):
     )
 
 
+def normalize_group(val):
+    """Turn Group_Val into a clean text key (1, 1.0, ' 1 ' -> '1')."""
+    if pd.isna(val):
+        return ""
+    s = str(val).strip()
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+    except:
+        pass
+    return s
+
+
+def safe_filename(name):
+    name = re.sub(r'[<>:"/\\|?*]', "_", str(name)).strip()
+    return name or "unnamed"
+
+
 # ===== HEADER / FOOTER =====
-def make_page_drawer(titles, version_text, footer_center, footer_right, mode, page_cnt_title):
+def make_page_drawer(titles, version_text, footer_center, footer_right, page_cnt_title):
 
     page_counter = {"count": 0}
 
@@ -123,19 +168,7 @@ def make_page_drawer(titles, version_text, footer_center, footer_right, mode, pa
 
         canvas.setFont("Helvetica", 8)
         text = f"Effective: {format_date(version_text)}"
-
-        if mode == "strike":
-            canvas.setFillColor(colors.red)
-            canvas.drawString(40, 35, text)
-            canvas.line(40, 38, 40 + canvas.stringWidth(text, "Helvetica", 8), 38)
-            canvas.setFillColor(colors.black)
-        elif mode == "highlight":
-            canvas.setFillColor(colors.yellow)
-            canvas.rect(39, 33, canvas.stringWidth(text, "Helvetica", 8) + 4, 10, fill=1, stroke=0)
-            canvas.setFillColor(colors.black)
-            canvas.drawString(40, 35, text)
-        else:
-            canvas.drawString(40, 35, text)
+        canvas.drawString(40, 35, text)
 
         canvas.drawCentredString(width / 2, 35, footer_center or "")
         canvas.drawRightString(width - 40, 35, footer_right)
@@ -146,8 +179,8 @@ def make_page_drawer(titles, version_text, footer_center, footer_right, mode, pa
     return draw_page
 
 
-# ===== PDF BUILDER (FIXED OVERFLOW) =====
-def build_pdf(df, flag_df, path, highlight, drawer, fixed_cols):
+# ===== PDF BUILDER (single memname) =====
+def build_pdf(df, path, drawer, fixed_cols):
 
     doc = SimpleDocTemplate(
         path,
@@ -160,11 +193,10 @@ def build_pdf(df, flag_df, path, highlight, drawer, fixed_cols):
     elements = []
     max_cols = 8
 
-    display_cols = [c for c in df.columns if c != "__key__"]
-    fixed_cols = [c for c in fixed_cols if c in display_cols]
+    display_cols = list(df.columns)
+    fixed_cols   = [c for c in fixed_cols if c in display_cols]
     scrollable_cols = [c for c in display_cols if c not in fixed_cols]
 
-    # Small safety margin so measured height never touches frame boundary
     SAFETY = 15
     usable_height = doc.height - SAFETY
 
@@ -172,38 +204,37 @@ def build_pdf(df, flag_df, path, highlight, drawer, fixed_cols):
         val = df.iloc[row_idx][col]
         if isinstance(val, Paragraph):
             return Paragraph(val.text, val.style)
-        else:
-            val = transform_display(val) if col in fixed_cols else format_value(val)
-            return safe_para(val)
+        val = transform_display(val) if col in fixed_cols else format_value(val)
+        return safe_para(val)
 
     def make_table(col_chunk, row_start, row_end):
-        if len(col_chunk) < 5:
-            col_widths = [70] * len(col_chunk)
-        else:
-            col_widths = [doc.width / len(col_chunk)] * len(col_chunk)
-
+        col_widths = (
+            [70] * len(col_chunk)
+            if len(col_chunk) < 5
+            else [doc.width / len(col_chunk)] * len(col_chunk)
+        )
         data = [[header_para(c) for c in col_chunk]]
         for idx in range(row_start, row_end):
             data.append([get_para(df, idx, col) for col in col_chunk])
 
-        t = Table(data, colWidths=col_widths, splitByRow=1, repeatRows=1)  # ← key: no auto-split
+        t = Table(data, colWidths=col_widths, splitByRow=1, repeatRows=1)
         t.setStyle(TableStyle([
-            ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("GRID",          (0, 0), (-1, -1), 1, colors.black),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+            ("TOPPADDING",    (0, 0), (-1, -1), 2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
         ]))
         return t, col_widths
 
     def measure_row_end(col_chunk, row_start):
-        if len(col_chunk) < 5:
-            col_widths = [70] * len(col_chunk)
-            table_width = sum(col_widths)
-        else:
-            col_widths = [doc.width / len(col_chunk)] * len(col_chunk)
-            table_width = doc.width
+        col_widths = (
+            [70] * len(col_chunk)
+            if len(col_chunk) < 5
+            else [doc.width / len(col_chunk)] * len(col_chunk)
+        )
+        table_width = sum(col_widths)
 
         row_end = row_start
         for probe_i in range(row_start, len(df)):
@@ -212,13 +243,12 @@ def build_pdf(df, flag_df, path, highlight, drawer, fixed_cols):
             if h > usable_height:
                 break
             row_end = probe_i + 1
-
         return row_end
 
     row_start = 0
     while row_start < len(df):
 
-        # Build all column chunks
+        # Build column chunks
         all_chunks = []
         col_start = 0
         while col_start < len(scrollable_cols):
@@ -226,54 +256,37 @@ def build_pdf(df, flag_df, path, highlight, drawer, fixed_cols):
             all_chunks.append(fixed_cols + scrollable_cols[col_start:col_end])
             col_start = col_end
 
-        # Probe all chunks, take minimum row_end
+        # Find minimum row_end across all chunks
         row_end = len(df)
         for chunk in all_chunks:
-            chunk_end = measure_row_end(chunk, row_start)
-            row_end = min(row_end, chunk_end)
+            row_end = min(row_end, measure_row_end(chunk, row_start))
 
         if row_end <= row_start:
             row_end = row_start + 1
 
-        # Render all chunks for rows [row_start, row_end)
-        for ci, columns in enumerate(all_chunks):
-            if len(columns) < 5:
-                col_widths = [70] * len(columns)
-                align_mode = 'LEFT'
-            else:
-                col_widths = [doc.width / len(columns)] * len(columns)
-                align_mode = 'LEFT'
+        # Render all chunks for this row slice
+        for columns in all_chunks:
+            col_widths = (
+                [70] * len(columns)
+                if len(columns) < 5
+                else [doc.width / len(columns)] * len(columns)
+            )
 
             data = [[header_para(c) for c in columns]]
             for idx in range(row_start, row_end):
                 data.append([get_para(df, idx, col) for col in columns])
 
-            table = Table(data, colWidths=col_widths, hAlign=align_mode, splitByRow=1, repeatRows=1)  # ← no auto-split
-
-            style_cmd = [
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
+            table = Table(data, colWidths=col_widths, hAlign="LEFT", splitByRow=1, repeatRows=1)
+            table.setStyle(TableStyle([
+                ("GRID",          (0, 0), (-1, -1), 1, colors.black),
+                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+                ("TOPPADDING",    (0, 0), (-1, -1), 2),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ]
+            ]))
 
-            if highlight and flag_df is not None:
-                for r in range(1, len(data)):
-                    actual_index = row_start + (r - 1)
-                    if actual_index >= len(flag_df):
-                        continue
-                    for c in range(len(columns)):
-                        col_idx = df.columns.get_loc(columns[c])
-                        if flag_df.iloc[actual_index, col_idx]:
-                            style_cmd.append(
-                                ("BACKGROUND", (c, r), (c, r), colors.yellow)
-                            )
-
-            table.setStyle(TableStyle(style_cmd))
             elements.append(table)
-
             elements.append(PageBreak())
 
         row_start = row_end
@@ -281,120 +294,230 @@ def build_pdf(df, flag_df, path, highlight, drawer, fixed_cols):
     doc.build(elements, onFirstPage=drawer, onLaterPages=drawer)
 
 
+# ===== MERGING WITH SIZE LIMIT =====
+# A "segment" is (memname, pdf_path, [page indexes]).
+def _build_writer(segments):
+    writer = PdfWriter()
+    for _, path, pages in segments:
+        reader = PdfReader(path)
+        for p in pages:
+            writer.add_page(reader.pages[p])
+    return writer
+
+
+def _size_of(segments):
+    writer = _build_writer(segments)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.tell()
+
+
+def split_into_parts(items, max_bytes):
+    """
+    items: list of (memname, pdf_path) in order.
+    Returns a list of parts; each part is a list of segments that together
+    stay within max_bytes. Whole memname PDFs are kept together whenever
+    possible; a single memname PDF larger than the limit is split by pages.
+    """
+    parts = []
+    current = []
+
+    for memname, path in items:
+        n_pages = len(PdfReader(path).pages)
+        seg = (memname, path, list(range(n_pages)))
+
+        # fits into the current part
+        if _size_of(current + [seg]) <= max_bytes:
+            current.append(seg)
+            continue
+
+        # start a new part
+        if current:
+            parts.append(current)
+            current = []
+
+        # fits alone
+        if _size_of([seg]) <= max_bytes:
+            current = [seg]
+            continue
+
+        # too big even alone -> split by pages
+        idx = 0
+        chunks = []
+        while idx < n_pages:
+            take = n_pages - idx
+            while take > 1 and _size_of([(memname, path, list(range(idx, idx + take)))]) > max_bytes:
+                take = max(1, int(take * 0.8)) if take > 5 else take - 1
+            chunks.append((memname, path, list(range(idx, idx + take))))
+            idx += take
+        for c in chunks[:-1]:
+            parts.append([c])
+        current = [chunks[-1]]
+
+    if current:
+        parts.append(current)
+    return parts
+
+
+def merge_group(group_val, items, out_folder, max_bytes):
+    """
+    Merge all memname PDFs of one group into one or more PDFs (each <= max_bytes).
+    Files are written with temporary names; final names are given later.
+    Returns list of (temp_pdf_path, [memnames]).
+    """
+    parts = split_into_parts(items, max_bytes)
+    results = []
+
+    for i, segs in enumerate(parts, start=1):
+        out_path = os.path.join(out_folder, f"group_{safe_filename(group_val)}_part_{i}.pdf")
+        writer = _build_writer(segs)
+        with open(out_path, "wb") as f:
+            writer.write(f)
+
+        memnames = []
+        for m, _, _ in segs:
+            if m not in memnames:
+                memnames.append(m)
+        results.append((out_path, memnames))
+
+    return results
+
+
+# ===== MAPPING EXCEL (highlighted header + autofit) =====
+MAPPING_COLUMNS = ["Group_Val", "SRT_TAB_ID", "MemName", "PDF Name", "PDF Part"]
+
+
+def save_mapping_excel(rows, path):
+    df = pd.DataFrame(rows, columns=MAPPING_COLUMNS)
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Mapping")
+        ws = writer.sheets["Mapping"]
+
+        thin = Side(style="thin", color="000000")
+        header_fill = PatternFill("solid", start_color="FFD966", end_color="FFD966")
+
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        # autofit column widths
+        for idx, col_cells in enumerate(ws.columns, start=1):
+            longest = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
+            ws.column_dimensions[get_column_letter(idx)].width = longest + 4
+
+        ws.freeze_panes = "A2"
+
+
 # ===== MAIN FUNCTION =====
-def generate_reports(input_file, config_1, config_2, output_folder):
-    """
-    Generate strike-through and highlight comparison PDFs for every memname
-    listed in the "Filing_tabs" sheet of `input_file`, comparing the matching
-    sheet in `config_1` against the matching sheet in `config_2`.
+def generate_single_reports(input_file, config_file, output_folder,
+                            pdf_names=PDF_NAMES, max_size_mb=MAX_PDF_SIZE_MB):
 
-    Sheet-name matching against the memname is case-insensitive (and ignores
-    surrounding whitespace).
+    base_name = safe_filename(pdf_names)
+    max_bytes = int(max_size_mb * 1024 * 1024)
 
-    Parameters
-    ----------
-    input_file : str
-        Path to the Excel file containing the "Filing_tabs" sheet that drives
-        the run (memname, titles, version, footnote, etc.).
-    config_1 : str
-        Path to the "before" Excel workbook.
-    config_2 : str
-        Path to the "after" Excel workbook.
-    output_folder : str
-        Folder where the generated PDFs will be written.
+    final_folder = os.path.join(output_folder, OUTPUT_SUBFOLDER)
+    os.makedirs(final_folder, exist_ok=True)
 
-    Returns
-    -------
-    dict with keys "strike_pdfs" and "highlight_pdfs", each a list of the
-    generated PDF paths (one per memname processed).
-    """
-
-    os.makedirs(output_folder, exist_ok=True)
+    temp_folder = tempfile.mkdtemp(prefix="memname_pdfs_")
+    merged_folder = tempfile.mkdtemp(prefix="merged_parts_")
 
     input_df = pd.read_excel(input_file, sheet_name="Filing_tabs")
     input_df.columns = input_df.columns.str.strip().str.lower()
 
-    strike_pdfs = []
-    highlight_pdfs = []
+    if "group_val" not in input_df.columns:
+        raise ValueError(f"'Group_Val' column not found in Filing_tabs. Columns: {list(input_df.columns)}")
 
-    for _, row in input_df.iterrows():
+    # group_val -> list of (memname, temp_pdf_path), order of first appearance kept
+    groups = {}
+    memname_srt = {}  # memname -> SRT_TAB_ID from input sheet
 
-        memname = str(row.get("memname", "")).strip()
-        if not memname:
-            continue
+    try:
+        # ---------- Step 1: build one temp PDF per memname ----------
+        for _, row in input_df.iterrows():
 
-        print(f"🚀 Processing: {memname}")
-
-        # Case-insensitive sheet name lookup in both config files
-        sheet_1 = find_sheet_name_ci(config_1, memname)
-        sheet_2 = find_sheet_name_ci(config_2, memname)
-
-        df1 = pd.read_excel(config_1, sheet_name=sheet_1).fillna("")
-        df2 = pd.read_excel(config_2, sheet_name=sheet_2).fillna("")
-
-        df1 = df1.applymap(clean_text)
-        df2 = df2.applymap(clean_text)
-
-        key_cols = get_fixed_columns(df1)
-
-        df1["__key__"] = build_key(df1, key_cols)
-        df2["__key__"] = build_key(df2, key_cols)
-
-        # FAST COMPARISON
-        merged = df1.merge(df2, on="__key__", how="left", suffixes=("_1", "_2"))
-        highlight_flag = pd.DataFrame(False, index=df1.index, columns=df1.columns)
-
-        for col in df1.columns:
-            if col == "__key__":
+            memname = str(row.get("memname", "")).strip()
+            if not memname or memname.lower() == "nan":
                 continue
-            highlight_flag[col] = ~(
-                merged[col + "_1"].apply(normalize).fillna("")
-                .eq(merged[col + "_2"].apply(normalize).fillna(""))
-            )
 
-        highlight_flag.loc[~df1["__key__"].isin(df2["__key__"]), :] = True
+            memname_srt[memname] = normalize_group(row.get("srt_tab_id", ""))
+            group_val = normalize_group(row.get("group_val", ""))
+            if group_val == "":
+                group_val = memname  # no group value -> its own group
 
-        # STRIKE
-        df1_lookup = df1.set_index("__key__").to_dict("index")
-        df_strike = df2.copy()
+            print(f" Processing: {memname}  (Group_Val = {group_val})")
 
-        for col in df2.columns:
-            df_strike[col] = [
-                strike_text(format_value(r[col])) if r["__key__"] not in df1_lookup
-                else safe_para(transform_display(r[col])) if col in key_cols
-                else strike_text(format_value(r[col])) if normalize(r[col]) != normalize(df1_lookup[r["__key__"]].get(col, ""))
-                else safe_para(format_value(r[col]))
-                for _, r in df2.iterrows()
-            ]
+            # Case-insensitive sheet name lookup
+            sheet_name = find_sheet_name_ci(config_file, memname)
 
-        titles = [str(row.get(f"title{i}", "")) for i in range(1, 5)]
-        version = str(row.get("version_current", ""))
-        page_cnt_title = str(row.get("page_cnt_title", ""))
+            df = pd.read_excel(config_file, sheet_name=sheet_name).fillna("")
+            df = df.map(clean_text) if hasattr(df, "map") else df.applymap(clean_text)
 
-        _, center, right = parse_footnote(str(row.get("footnote1", "")))
+            fixed_cols = get_fixed_columns(df)
 
-        drawer_strike = make_page_drawer(titles, version, center, right, "strike", page_cnt_title)
-        drawer_highlight = make_page_drawer(titles, version, center, right, "highlight", page_cnt_title)
+            titles         = [str(row.get(f"title{i}", "")) for i in range(1, 5)]
+            version        = str(row.get("version_current", ""))
+            page_cnt_title = str(row.get("page_cnt_title", ""))
+            _, center, right = parse_footnote(str(row.get("footnote1", "")))
 
-        pdf_strike = os.path.join(output_folder, f"{memname}_strike.pdf")
-        pdf_highlight = os.path.join(output_folder, f"{memname}_highlight.pdf")
+            drawer = make_page_drawer(titles, version, center, right, page_cnt_title)
 
-        build_pdf(df_strike, None, pdf_strike, False, drawer_strike, key_cols)
-        build_pdf(df1, highlight_flag, pdf_highlight, True, drawer_highlight, key_cols)
+            tmp_pdf = os.path.join(temp_folder, f"{safe_filename(memname)}.pdf")
+            build_pdf(df, tmp_pdf, drawer, fixed_cols)
 
-        strike_pdfs.append(pdf_strike)
-        highlight_pdfs.append(pdf_highlight)
+            groups.setdefault(group_val, []).append((memname, tmp_pdf))
 
-    print("✅ DONE")
+        # ---------- Step 2: merge per group (max size enforced) ----------
+        all_parts = []  # (group_val, temp_path, memnames) in final order
 
-    return {"strike_pdfs": strike_pdfs, "highlight_pdfs": highlight_pdfs}
+        for group_val, items in groups.items():
+            print(f"\n Merging Group_Val = {group_val} ({len(items)} memname(s))")
+            for tmp_path, memnames in merge_group(group_val, items, merged_folder, max_bytes):
+                all_parts.append((group_val, tmp_path, memnames))
+
+        # ---------- Step 2b: final names, numbered across ALL groups ----------
+        total_files = len(all_parts)
+        mapping_rows = []
+        all_pdfs = []
+
+        for file_no, (group_val, tmp_path, memnames) in enumerate(all_parts, start=1):
+            pdf_name = f"{base_name} page {file_no} of {total_files}.pdf"
+            final_path = os.path.join(final_folder, pdf_name)
+            shutil.move(tmp_path, final_path)
+            all_pdfs.append(final_path)
+            print(f"    Saved: {final_path}  ({os.path.getsize(final_path) / 1024 / 1024:.2f} MB)")
+
+            for m in memnames:
+                mapping_rows.append({
+                    "Group_Val":  group_val,
+                    "SRT_TAB_ID": memname_srt.get(m, ""),
+                    "MemName":    m,
+                    "PDF Name":  pdf_name,
+                    "PDF Part":  f"{file_no} of {total_files}",
+                })
+
+        # ---------- Step 3: mapping Excel ----------
+        mapping_path = os.path.join(final_folder, MAPPING_EXCEL_NAME)
+        save_mapping_excel(mapping_rows, mapping_path)
+        print(f"\n Mapping sheet saved: {mapping_path}")
+
+    finally:
+        shutil.rmtree(temp_folder, ignore_errors=True)
+        shutil.rmtree(merged_folder, ignore_errors=True)
+
+    print(" DONE")
+    return all_pdfs
 
 
-if __name__ == "__main__":
-    # Example usage
-    generate_reports(
-        input_file=r"D:\filling_input_exl\input.xlsx",
-        config_1=r"D:\filling_input_exl\config.xlsx",
-        config_2=r"D:\filling_input_exl\config2.xlsx",
-        output_folder=r"D:\filling_input_exl",
-    )
+generate_single_reports(
+    input_file=SAS.symget("input_file"),
+    config_file=SAS.symget("config_file"),
+    output_folder=SAS.symget("output_folder"),   # "Proffs" folder is created inside this
+    pdf_names=PDF_NAMES,
+    max_size_mb=MAX_PDF_SIZE_MB,
+)
+
+endsubmit;
+run;
