@@ -1,157 +1,249 @@
-/*====================================================================
-  Fire and water PDF report generator  -  SAS Viya version
-  Runs the Python report code through PROC PYTHON.
-
-  BEFORE RUNNING
-  1. Change the 5 %LET values below (paths are SERVER paths, Linux style,
-     not D:\ ; upload input.xlsx and config2.xlsx to the server first).
-  2. The Python on the Viya compute server needs these packages:
-       pandas, openpyxl, reportlab, pypdf
-  3. PROC PYTHON must be configured by your admin (MAS_PYPATH / MAS_M2PATH).
-
-  OUTPUT (same as the Python script): <output_folder>/Proffs/
-       "<pdf_names> page N of M.pdf"  files  +  PDF_Mapping.xlsx
-====================================================================*/
-
-%let input_file    = /your/server/path/input.xlsx;
-%let config_file   = /your/server/path/config2.xlsx;
-%let output_folder = /your/server/path/output;
-%let pdf_names     = Fire and water;
-%let max_size_mb   = 3;
-
-proc python;
-submit;
-# ---------- diagnostics: shows which Python is used and what is missing ----------
-import sys, importlib.util, traceback
-print("Python executable:", sys.executable)
-print("Python version   :", sys.version.split()[0])
-_missing = [m for m in ["pandas", "openpyxl", "reportlab", "pypdf"] if importlib.util.find_spec(m) is None]
-if _missing:
-    print("MISSING PYTHON PACKAGES:", _missing)
-    raise ImportError("Install these packages for the Python above: " + ", ".join(_missing))
-print("All required packages found.")
-
-import pandas as pd
 import os
 import re
 import io
+import html
 import shutil
 import tempfile
-from pypdf import PdfReader, PdfWriter
+import traceback
+from concurrent.futures import ProcessPoolExecutor
+
+import numpy as np
+import pandas as pd
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, PageBreak, Paragraph
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    BaseDocTemplate, PageTemplate, Frame, Table, TableStyle, PageBreak, Paragraph
+)
 
-styles = getSampleStyleSheet()
-normal_style = ParagraphStyle(name="NormalSmall", parent=styles["Normal"], fontSize=8, leading=9, alignment=1)
-header_style = ParagraphStyle(name="HeaderSmall", parent=styles["Normal"], fontSize=8, leading=9, alignment=1)
+try:
+    from pypdf import PdfReader, PdfWriter
+except ImportError:
+    from PyPDF2 import PdfReader, PdfWriter
 
-width, height = letter
 
 # =====================================================================
 # USER SETTINGS
 # =====================================================================
 # Base name for ALL final PDFs. Files are numbered continuously across all
-# groups, e.g. "Fire and water page 1 of 6.pdf" ... "Fire and water page 6 of 6.pdf"
-PDF_NAMES = SAS.symget("pdf_names")
+# groups, e.g. "Mock Rate Pages page 1 of 6.pdf" ... "Mock Rate Pages page 6 of 6.pdf"
+PDF_NAMES = "Mock Rate Pages"
 
-MAX_PDF_SIZE_MB = float(SAS.symget("max_size_mb"))
-OUTPUT_SUBFOLDER = "Proffs"
+MAX_PDF_SIZE_MB = 3              # no final PDF will be bigger than this
+OUTPUT_SUBFOLDER = "Mocks"       # created inside output_folder
 MAPPING_EXCEL_NAME = "PDF_Mapping.xlsx"
 
+STRIKE_FIRST = False             # False = first half of each PDF is highlight, second half is strike
+                                 # True  = first half strike, second half highlight
+USE_PARALLEL = True              # build the memname PDFs on several CPU cores (falls back automatically)
+MAX_WORKERS = 8                  # upper limit of CPU cores used
 
-# ===== HELPERS =====
+MAX_COLS = 8
+PAGE_MARGINS = dict(left=40, right=40, top=80, bottom=55)
+SAFETY = 6
+
+COMPARE_DISPLAYED_VALUES = False
+
+
+# =====================================================================
+# HELPERS (unchanged logic)
+# =====================================================================
+def safe_str(v):
+    """str() that turns NaN/None into '' (so 'nan' never gets printed)."""
+    if v is None:
+        return ""
+    if not isinstance(v, str) and pd.isna(v):
+        return ""
+    return str(v).strip()
+
+
+def df_map(df, func):
+    return df.apply(lambda col: col.map(func))
+
+
 def clean_text(x):
-    if pd.isna(x):
+    if not isinstance(x, str) and pd.isna(x):
         return ""
     return " ".join(str(x).strip().lower().split())
 
 
-def get_fixed_columns(df):
-    for i, col in enumerate(df.columns):
-        if str(col).strip().lower() in ["fire", "risk"]:
-            return list(df.columns[:i])
-    return [df.columns[0]]
+def normalize(val):
+    """Makes '5', '5.0', 5 and 5.00 compare equal; text is compared case-insensitively."""
+    if not isinstance(val, str) and pd.isna(val):
+        return ""
+    if val == "":
+        return ""
+    try:
+        return str(float(val)).rstrip("0").rstrip(".")
+    except Exception:
+        return str(val).strip().lower()
 
 
 def format_value(val):
     try:
         return f"{float(val):.4f}"
-    except:
+    except Exception:
         return str(val)
 
 
 def transform_display(val):
     try:
+        float_val = float(val)
         int_val = int(float(val))
-        if int_val < -10:
-            return "No information"
-        if int_val >= 1000:
-            return ">1000"
-        return str(int_val)
-    except:
+        if int_val < 1:
+            return "No Information"
+        if str(int_val).startswith("999") and len(str(int_val)) >= 3:
+            numd = len(str(int_val))
+            return ">" + "1" + "0" * numd
+        if str(float_val).startswith("9.99"):
+            return ">" + "1" + "0"
+        if str(float_val).startswith("99.9"):
+            return ">" + "1" + "00"
+
+        s = str(val).strip()
+
+        if "e" in s.lower():
+            formatted = f"{float_val:.6f}".rstrip("0")
+            if "." in formatted:
+                deci = len(formatted.split(".")[1])
+                places = min(deci, 4)
+                return f"{float_val:.{places}f}"
+            return formatted
+
+        if "." not in s:
+            return str(int_val)
+
+        return f"{float_val:.4f}"
+    except Exception:
         return str(val)
+
+
+def cell_text(val, is_fixed):
+    return transform_display(val) if is_fixed else format_value(val)
 
 
 def format_date(val):
     try:
-        d = pd.to_datetime(val)
-        return f"{d.month:02d}/{d.day:02d}/{d.year}"
-    except:
+        return pd.to_datetime(val).strftime("%m/%d/%Y")
+    except Exception:
         return str(val)
 
 
-def safe_para(val):
-    AMP = chr(38)
-    val = str(val).replace(AMP, AMP + "amp;").replace("<", AMP + "lt;").replace(">", AMP + "gt;")
-    return Paragraph(val, normal_style)
+# ---- tolerant footnote parser ---------------------------------------------
+# Accepts straight quotes and Excel "smart" quotes, any letter case,
+# optional ':' or '=' after the keyword, and non-breaking spaces.
+_Q = '"\u201c\u201d\u201e\u201f\u2033'
 
 
-def header_para(text):
-    return Paragraph(f"<b>{text}</b>", header_style)
+def _grab(text, label):
+    m = re.search(
+        rf'{label}\s*[:=]?\s*[{_Q}]([^{_Q}]*)[{_Q}]',
+        text,
+        flags=re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else ""
 
 
 def parse_footnote(text):
-    left   = re.search(r'left\s*"([^"]*)"',   text)
-    center = re.search(r'center\s*"([^"]*)"', text)
-    right  = re.search(r'right\s*"([^"]*)"',  text)
-    return (
-        left.group(1).strip()   if left   else "",
-        center.group(1).strip() if center else "",
-        right.group(1).strip()  if right  else ""
-    )
+    text = str(text).replace("\xa0", " ")
+    return _grab(text, "left"), _grab(text, "center"), _grab(text, "right")
+# ----------------------------------------------------------------------------
 
 
-def find_sheet_name_ci(excel_path, target_name):
+_DATE_RE = re.compile(r"\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4}")
+
+
+def date_from_footnote(footnote_raw):
     """
-    Return the actual sheet name inside excel_path that matches target_name
-    case-insensitively (and ignoring surrounding whitespace).
-    Raises ValueError if no match is found.
+    The ONLY source of the footer date: the footnote1 cell.
+    Looks for a date (e.g. 11/19/2016) anywhere in the footnote text and
+    returns it as mm/dd/yyyy. Returns '' if footnote1 has no date.
     """
-    xl = pd.ExcelFile(excel_path)
-    target_clean = str(target_name).strip().lower()
-    for sheet in xl.sheet_names:
-        if str(sheet).strip().lower() == target_clean:
-            return sheet
-    raise ValueError(
-        f"No sheet matching '{target_name}' (case-insensitive) found in {excel_path}. "
-        f"Available sheets: {xl.sheet_names}"
+    m = _DATE_RE.search(str(footnote_raw or ""))
+    return format_date(m.group(0)) if m else ""
+
+
+def get_fixed_columns(df):
+    """Columns that stay on every page = everything before the first fire/risk/rate column."""
+    for i, col in enumerate(df.columns):
+        if str(col).strip().lower() in ("fire", "risk", "rate"):
+            return list(df.columns[:i]) or [df.columns[0]]
+    return [df.columns[0]]
+
+
+def find_sheet(xl, name):
+    if name in xl.sheet_names:
+        return name
+    lookup = {n.strip().lower(): n for n in xl.sheet_names}
+    return lookup.get(name.strip().lower())
+
+
+def load_sheet(xl, sheet_name):
+    df = xl.parse(sheet_name)
+    df = df.dropna(how="all").reset_index(drop=True)        # drop fully blank rows
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.fillna("")
+    df = df_map(df, lambda v: v.strip() if isinstance(v, str) else v)
+    return df
+
+
+def build_key(df_clean, cols):
+    """
+    Row key built from the fixed columns.
+    A running counter is appended so duplicate keys stay unique and line up in order.
+    This is what stops rows/highlights from getting shifted.
+    """
+    base = df_clean[cols].apply(
+        lambda r: "|".join(normalize(clean_text(v)) for v in r), axis=1
     )
+    return base + "#" + base.groupby(base).cumcount().astype(str)
+
+
+def same(a, b):
+    if COMPARE_DISPLAYED_VALUES:
+        return format_value(a) == format_value(b)
+    return normalize(a) == normalize(b)
+
+
+def compare_frames(df_a, df_b, key_cols):
+    """
+    Returns a bool array shaped like df_a.
+    True  = this cell of df_a is new / different compared with df_b.
+    A row that does not exist in df_b is True for the whole row.
+    """
+    ca = df_map(df_a, clean_text)
+    cb = df_map(df_b, clean_text)
+    keys_a = build_key(ca, key_cols)
+    keys_b = build_key(cb, key_cols)
+
+    lookup_b = dict(zip(keys_b, cb.to_dict("records")))
+    cols = list(df_a.columns)
+    flags = np.zeros((len(df_a), len(cols)), dtype=bool)
+
+    for i, (k, rec) in enumerate(zip(keys_a, ca.to_dict("records"))):
+        other = lookup_b.get(k)
+        if other is None:
+            flags[i, :] = True
+            continue
+        for j, c in enumerate(cols):
+            if c in key_cols:
+                continue
+            flags[i, j] = not same(rec[c], other.get(c, ""))
+    return flags
 
 
 def normalize_group(val):
     """Turn Group_Val into a clean text key (1, 1.0, ' 1 ' -> '1')."""
-    if pd.isna(val):
+    if val is None or (not isinstance(val, str) and pd.isna(val)):
         return ""
     s = str(val).strip()
     try:
         f = float(s)
         if f == int(f):
             return str(int(f))
-    except:
+    except Exception:
         pass
     return s
 
@@ -161,14 +253,15 @@ def safe_filename(name):
     return name or "unnamed"
 
 
-# ===== HEADER / FOOTER =====
-def make_page_drawer(titles, version_text, footer_center, footer_right, page_cnt_title):
-
+# =====================================================================
+# PAGE HEADER / FOOTER + PDF BUILDER (unchanged logic)
+# =====================================================================
+def make_page_drawer(titles, version_text, footer_center, footer_right, mode, page_cnt_title):
+    width, height = letter
     page_counter = {"count": 0}
 
     def draw_page(canvas, doc):
         page_counter["count"] += 1
-
         canvas.setFont("Helvetica-Bold", 10)
         y = height - 30
         for t in titles:
@@ -177,141 +270,225 @@ def make_page_drawer(titles, version_text, footer_center, footer_right, page_cnt
                 y -= 13
 
         canvas.setFont("Helvetica", 8)
-        text = f"Effective: {format_date(version_text)}"
-        canvas.drawString(40, 35, text)
+        text = format_date(version_text) if version_text else ""
 
+        if mode == "strike":
+            canvas.setFillColor(colors.red)
+            canvas.drawString(40, 35, text)
+            canvas.line(40, 38, 40 + canvas.stringWidth(text, "Helvetica", 8), 38)
+            canvas.setFillColor(colors.black)
+        elif mode == "highlight":
+            canvas.setFillColor(colors.yellow)
+            canvas.rect(39, 33, canvas.stringWidth(text, "Helvetica", 8) + 4, 10, fill=1, stroke=0)
+            canvas.setFillColor(colors.black)
+            canvas.drawString(40, 35, text)
+        else:
+            canvas.drawString(40, 35, text)
+
+        # reset state explicitly so the footer text is always drawn in black Helvetica 8
+        canvas.setFillColor(colors.black)
+        canvas.setStrokeColor(colors.black)
+        canvas.setFont("Helvetica", 8)
         canvas.drawCentredString(width / 2, 35, footer_center or "")
-        canvas.drawRightString(width - 40, 35, footer_right)
-
-        page_text = f"{page_cnt_title} {page_counter['count']}"
-        canvas.drawRightString(width - 40, 20, page_text)
+        canvas.drawRightString(width - 40, 35, footer_right or "")
+        canvas.drawRightString(width - 40, 20, f"{page_cnt_title}{page_counter['count']}")
 
     return draw_page
 
 
-# ===== PDF BUILDER (single memname) =====
-def build_pdf(df, path, drawer, fixed_cols):
+def build_pdf(df, flags, path, mode, drawer, key_cols, header_style, normal_style):
+    """
+    mode = "highlight": cells where flags is True get a yellow background
+    mode = "strike"   : cells where flags is True are printed red + struck through
+    Every column of df is printed. Wide sheets are split over several pages
+    (fixed columns repeat on each page). Rows are packed so that a page is
+    filled completely and never spills onto an extra page.
+    """
+    cols = list(df.columns)
+    n_rows = len(df)
+    pos = {c: i for i, c in enumerate(cols)}
 
-    doc = SimpleDocTemplate(
-        path,
-        pagesize=letter,
-        leftMargin=40, rightMargin=40,
-        topMargin=110,
-        bottomMargin=55
-    )
+    fixed = [c for c in key_cols if c in pos]
+    rest = [c for c in cols if c not in fixed]
+
+    step = max(1, MAX_COLS - len(fixed))
+    chunks = [fixed + rest[i:i + step] for i in range(0, len(rest), step)] or [fixed]
+
+    text = {c: [cell_text(v, c in fixed) for v in df[c]] for c in cols}
+
+    page_w, page_h = letter
+    m = PAGE_MARGINS
+    frame_w = page_w - m["left"] - m["right"]
+    frame_h = page_h - m["top"] - m["bottom"]
+    usable_h = frame_h - SAFETY
+    PAD_H, PAD_V = 4, 2
+
+    def col_widths(n):
+        return [70] * n if n < 5 else [frame_w / n] * n
+
+    def make_cell(i, c):
+        t = html.escape(text[c][i], quote=False)
+        if t and mode == "strike" and flags[i, pos[c]]:
+            t = f'<font color="red"><strike>{t}</strike></font>'
+        return Paragraph(t or "&nbsp;", normal_style)
+
+    def make_header(c):
+        return Paragraph(f"<b>{html.escape(str(c), quote=False)}</b>", header_style)
+
+    def para_h(p, w):
+        return p.wrap(w - 2 * PAD_H, 10000)[1]
+
+    chunk_info = []
+    for chunk in chunks:
+        widths = col_widths(len(chunk))
+        hdr_h = max(para_h(make_header(c), w) for c, w in zip(chunk, widths)) + 2 * PAD_V
+        row_hs = [
+            max(para_h(make_cell(i, c), w) for c, w in zip(chunk, widths)) + 2 * PAD_V
+            for i in range(n_rows)
+        ]
+        chunk_info.append((widths, hdr_h, row_hs))
+
+    def fit_end(row_start):
+        """Last row (exclusive) that fits on the page for ALL column chunks."""
+        end = n_rows
+        for widths, hdr_h, row_hs in chunk_info:
+            total, e = hdr_h, row_start
+            while e < n_rows and total + row_hs[e] <= usable_h:
+                total += row_hs[e]
+                e += 1
+            end = min(end, e)
+        return max(end, row_start + 1)
+
+    def make_table(chunk, widths, r0, r1):
+        data = [[make_header(c) for c in chunk]]
+        for i in range(r0, r1):
+            data.append([make_cell(i, c) for c in chunk])
+
+        t = Table(data, colWidths=widths, hAlign="LEFT")
+        style = [
+            ("GRID", (0, 0), (-1, -1), 1.2, colors.black),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), PAD_V),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), PAD_V),
+            ("LEFTPADDING", (0, 0), (-1, -1), PAD_H),
+            ("RIGHTPADDING", (0, 0), (-1, -1), PAD_H),
+        ]
+        if mode == "highlight":
+            for i in range(r0, r1):
+                for ci, c in enumerate(chunk):
+                    if flags[i, pos[c]]:
+                        style.append(("BACKGROUND", (ci, i - r0 + 1), (ci, i - r0 + 1), colors.yellow))
+        t.setStyle(TableStyle(style))
+        return t
 
     elements = []
-    max_cols = 8
-
-    display_cols = list(df.columns)
-    fixed_cols   = [c for c in fixed_cols if c in display_cols]
-    scrollable_cols = [c for c in display_cols if c not in fixed_cols]
-
-    SAFETY = 15
-    usable_height = doc.height - SAFETY
-
-    def get_para(df, row_idx, col):
-        val = df.iloc[row_idx][col]
-        if isinstance(val, Paragraph):
-            return Paragraph(val.text, val.style)
-        val = transform_display(val) if col in fixed_cols else format_value(val)
-        return safe_para(val)
-
-    def make_table(col_chunk, row_start, row_end):
-        col_widths = (
-            [70] * len(col_chunk)
-            if len(col_chunk) < 5
-            else [doc.width / len(col_chunk)] * len(col_chunk)
-        )
-        data = [[header_para(c) for c in col_chunk]]
-        for idx in range(row_start, row_end):
-            data.append([get_para(df, idx, col) for col in col_chunk])
-
-        t = Table(data, colWidths=col_widths, splitByRow=1, repeatRows=1)
-        t.setStyle(TableStyle([
-            ("GRID",          (0, 0), (-1, -1), 1, colors.black),
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
-            ("TOPPADDING",    (0, 0), (-1, -1), 2),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ]))
-        return t, col_widths
-
-    def measure_row_end(col_chunk, row_start):
-        col_widths = (
-            [70] * len(col_chunk)
-            if len(col_chunk) < 5
-            else [doc.width / len(col_chunk)] * len(col_chunk)
-        )
-        table_width = sum(col_widths)
-
-        row_end = row_start
-        for probe_i in range(row_start, len(df)):
-            t, _ = make_table(col_chunk, row_start, probe_i + 1)
-            _, h = t.wrap(table_width, usable_height)
-            if h > usable_height:
-                break
-            row_end = probe_i + 1
-        return row_end
-
     row_start = 0
-    while row_start < len(df):
+    while row_start < n_rows:
+        row_end = fit_end(row_start)
 
-        # Build column chunks
-        all_chunks = []
-        col_start = 0
-        while col_start < len(scrollable_cols):
-            col_end = min(col_start + (max_cols - len(fixed_cols)), len(scrollable_cols))
-            all_chunks.append(fixed_cols + scrollable_cols[col_start:col_end])
-            col_start = col_end
+        while True:
+            tables = [make_table(ch, w, row_start, row_end) for ch, (w, _, _) in zip(chunks, chunk_info)]
+            too_tall = any(t.wrap(frame_w, 10000)[1] > usable_h for t in tables)
+            if not too_tall or row_end - row_start <= 1:
+                break
+            row_end -= 1
 
-        # Find minimum row_end across all chunks
-        row_end = len(df)
-        for chunk in all_chunks:
-            row_end = min(row_end, measure_row_end(chunk, row_start))
-
-        if row_end <= row_start:
-            row_end = row_start + 1
-
-        # Render all chunks for this row slice
-        for columns in all_chunks:
-            col_widths = (
-                [70] * len(columns)
-                if len(columns) < 5
-                else [doc.width / len(columns)] * len(columns)
-            )
-
-            data = [[header_para(c) for c in columns]]
-            for idx in range(row_start, row_end):
-                data.append([get_para(df, idx, col) for col in columns])
-
-            table = Table(data, colWidths=col_widths, hAlign="LEFT", splitByRow=1, repeatRows=1)
-            table.setStyle(TableStyle([
-                ("GRID",          (0, 0), (-1, -1), 1, colors.black),
-                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING",   (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
-                ("TOPPADDING",    (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ]))
-
-            elements.append(table)
-            elements.append(PageBreak())
-
+        for t in tables:
+            if elements:
+                elements.append(PageBreak())
+            elements.append(t)
         row_start = row_end
 
-    doc.build(elements, onFirstPage=drawer, onLaterPages=drawer)
+    doc = BaseDocTemplate(
+        path, pagesize=letter,
+        leftMargin=m["left"], rightMargin=m["right"],
+        topMargin=m["top"], bottomMargin=m["bottom"],
+        pageCompression=1,
+    )
+    frame = Frame(m["left"], m["bottom"], frame_w, frame_h,
+                  leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0, id="main")
+    doc.addPageTemplates([PageTemplate(id="main", frames=[frame], onPage=drawer)])
+    doc.build(elements)
 
 
-# ===== MERGING WITH SIZE LIMIT =====
-# A "segment" is (memname, pdf_path, [page indexes]).
+# =====================================================================
+# ONE MEMNAME -> TWO TEMP PDFs (highlight pages + strike pages)
+# Runs in a worker process, so it only uses plain, picklable inputs.
+# =====================================================================
+def _make_styles():
+    styles = getSampleStyleSheet()
+    normal_style = ParagraphStyle(name="NormalSmall", parent=styles["Normal"],
+                                  fontSize=8, leading=9, alignment=1)
+    header_style = ParagraphStyle(name="HeaderSmall", parent=styles["Normal"],
+                                  fontSize=7, leading=8, alignment=1, textColor=colors.black)
+    return normal_style, header_style
+
+
+def process_one(task):
+    """Returns {"ok": bool, "h_path": str, "s_path": str, "reason": str, "log": [str]}"""
+    log = []
+    try:
+        df1, df2 = task["df1"], task["df2"]          # df1 = proposed, df2 = current
+        key_cols = task["key_cols"]
+        normal_style, header_style = _make_styles()
+
+        highlight_flags = compare_frames(df1, df2, key_cols)   # rows of PROPOSED
+        strike_flags = compare_frames(df2, df1, key_cols)      # rows of CURRENT
+
+        footnote_raw = task["footnote_raw"]
+        _, center, right = parse_footnote(footnote_raw)
+
+        # footer date (bottom-left) comes ONLY from footnote1
+        version = date_from_footnote(footnote_raw)
+        if not version:
+            log.append("  WARNING: no date found in footnote1 - left footer will be empty")
+        log.append(f"  footer left(date) = {version!r} | center = {center!r} | right = {right!r}")
+
+        titles = task["titles"]
+        page_cnt_title = task["page_cnt_title"]
+        drawer_strike = make_page_drawer(titles, version, center, right, "strike", page_cnt_title)
+        drawer_highlight = make_page_drawer(titles, version, center, right, "highlight", page_cnt_title)
+
+        base = task["base_path"]
+        pdf_strike, pdf_highlight = base + "_s.pdf", base + "_h.pdf"
+
+        build_pdf(df2, strike_flags, pdf_strike, "strike", drawer_strike,
+                  key_cols, header_style, normal_style)
+        build_pdf(df1, highlight_flags, pdf_highlight, "highlight", drawer_highlight,
+                  key_cols, header_style, normal_style)
+
+        log.append(f"Completed: {task['memname']}")
+        return {"ok": True, "h_path": pdf_highlight, "s_path": pdf_strike, "reason": "", "log": log}
+
+    except Exception as e:
+        log.append(f"ERROR while processing '{task['memname']}':")
+        log.append(traceback.format_exc())
+        return {"ok": False, "h_path": "", "s_path": "", "reason": f"Error: {e}", "log": log}
+
+
+# =====================================================================
+# MERGING WITH SIZE LIMIT
+# A memname item is (memname, highlight_pdf, strike_pdf).
+# A "segment" is (memname, [page refs]); a page ref is (pdf_path, page_index, rank).
+# Inside every final PDF all HIGHLIGHT pages come first (first half), then all
+# STRIKE pages (second half) - STRIKE_FIRST flips this.
+# =====================================================================
+def _page_refs(h_path, s_path):
+    rank_h, rank_s = (1, 0) if STRIKE_FIRST else (0, 1)
+    refs = [(h_path, i, rank_h) for i in range(len(PdfReader(h_path).pages))]
+    refs += [(s_path, i, rank_s) for i in range(len(PdfReader(s_path).pages))]
+    return sorted(refs, key=lambda r: r[2])
+
+
 def _build_writer(segments):
+    refs = [r for _, rs in segments for r in rs]
+    refs.sort(key=lambda r: r[2])            # stable: first-half pages, then second-half pages
+    readers = {}
     writer = PdfWriter()
-    for _, path, pages in segments:
-        reader = PdfReader(path)
-        for p in pages:
-            writer.add_page(reader.pages[p])
+    for path, idx, _ in refs:
+        if path not in readers:
+            readers[path] = PdfReader(path)
+        writer.add_page(readers[path].pages[idx])
     return writer
 
 
@@ -324,41 +501,38 @@ def _size_of(segments):
 
 def split_into_parts(items, max_bytes):
     """
-    items: list of (memname, pdf_path) in order.
-    Returns a list of parts; each part is a list of segments that together
-    stay within max_bytes. Whole memname PDFs are kept together whenever
-    possible; a single memname PDF larger than the limit is split by pages.
+    EXACT (slower) splitter, used only as a fallback.
+    items: list of (memname, highlight_pdf, strike_pdf) in order.
+    Whole memnames are kept together whenever possible; a single memname
+    larger than the limit is split by pages.
     """
     parts = []
     current = []
 
-    for memname, path in items:
-        n_pages = len(PdfReader(path).pages)
-        seg = (memname, path, list(range(n_pages)))
+    for memname, h_path, s_path in items:
+        refs = _page_refs(h_path, s_path)
+        seg = (memname, refs)
 
-        # fits into the current part
         if _size_of(current + [seg]) <= max_bytes:
             current.append(seg)
             continue
 
-        # start a new part
         if current:
             parts.append(current)
             current = []
 
-        # fits alone
         if _size_of([seg]) <= max_bytes:
             current = [seg]
             continue
 
-        # too big even alone -> split by pages
+        n_pages = len(refs)
         idx = 0
         chunks = []
         while idx < n_pages:
             take = n_pages - idx
-            while take > 1 and _size_of([(memname, path, list(range(idx, idx + take)))]) > max_bytes:
+            while take > 1 and _size_of([(memname, refs[idx:idx + take])]) > max_bytes:
                 take = max(1, int(take * 0.8)) if take > 5 else take - 1
-            chunks.append((memname, path, list(range(idx, idx + take))))
+            chunks.append((memname, refs[idx:idx + take]))
             idx += take
         for c in chunks[:-1]:
             parts.append([c])
@@ -369,36 +543,69 @@ def split_into_parts(items, max_bytes):
     return parts
 
 
+def plan_parts(items, max_bytes):
+    """FAST planning: add up the file sizes of the memname PDFs (no re-building)."""
+    parts, cur, cur_size = [], [], 0
+    for memname, h_path, s_path in items:
+        sz = os.path.getsize(h_path) + os.path.getsize(s_path)
+        if cur and cur_size + sz > max_bytes:
+            parts.append(cur)
+            cur, cur_size = [], 0
+        cur.append((memname, h_path, s_path))
+        cur_size += sz
+    if cur:
+        parts.append(cur)
+    return parts
+
+
 def merge_group(group_val, items, out_folder, max_bytes):
     """
     Merge all memname PDFs of one group into one or more PDFs (each <= max_bytes).
     Files are written with temporary names; final names are given later.
     Returns list of (temp_pdf_path, [memnames]).
     """
-    parts = split_into_parts(items, max_bytes)
     results = []
+    counter = [0]
 
-    for i, segs in enumerate(parts, start=1):
-        out_path = os.path.join(out_folder, f"group_{safe_filename(group_val)}_part_{i}.pdf")
+    def write_part(segs):
+        counter[0] += 1
+        out_path = os.path.join(out_folder, f"group_{safe_filename(group_val)}_part_{counter[0]}.pdf")
         writer = _build_writer(segs)
         with open(out_path, "wb") as f:
             writer.write(f)
-
         memnames = []
-        for m, _, _ in segs:
+        for m, _ in segs:
             if m not in memnames:
                 memnames.append(m)
-        results.append((out_path, memnames))
+        return out_path, memnames
+
+    for part_items in plan_parts(items, max_bytes):
+        segs = [(m, _page_refs(h, s_)) for m, h, s_ in part_items]
+        out_path, memnames = write_part(segs)
+
+        # the plan is an estimate - verify the real size, fall back to exact splitting if needed
+        if os.path.getsize(out_path) > max_bytes:
+            os.remove(out_path)
+            counter[0] -= 1
+            for exact_segs in split_into_parts(part_items, max_bytes):
+                results.append(write_part(exact_segs))
+        else:
+            results.append((out_path, memnames))
 
     return results
 
 
-# ===== MAPPING EXCEL (highlighted header + autofit) =====
-MAPPING_COLUMNS = ["Group_Val", "SRT_TAB_ID", "MemName", "PDF Name", "PDF Part"]
+# =====================================================================
+# MAPPING EXCEL (highlighted header, red rows for skipped memnames, autofit)
+# =====================================================================
+MAPPING_COLUMNS = ["Group_Val", "SRT_TAB_ID", "MemName", "PDF Name", "PDF Part", "Remarks"]
+NOT_CREATED = "NOT CREATED"
 
 
 def save_mapping_excel(rows, path):
-    df = pd.DataFrame(rows, columns=MAPPING_COLUMNS)
+    df = pd.DataFrame(rows, columns=MAPPING_COLUMNS + ["Missing"])
+    missing_flags = df["Missing"].tolist()
+    df = df[MAPPING_COLUMNS]
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Mapping")
@@ -413,6 +620,14 @@ def save_mapping_excel(rows, path):
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
+        # skipped memnames in red
+        red_fill = PatternFill("solid", start_color="F8CBAD", end_color="F8CBAD")
+        for excel_row, is_missing in enumerate(missing_flags, start=2):
+            if is_missing:
+                for cell in ws[excel_row]:
+                    cell.fill = red_fill
+                    cell.font = Font(bold=True)
+
         # autofit column widths
         for idx, col_cells in enumerate(ws.columns, start=1):
             longest = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
@@ -421,73 +636,151 @@ def save_mapping_excel(rows, path):
         ws.freeze_panes = "A2"
 
 
-# ===== MAIN FUNCTION =====
-def generate_single_reports(input_file, config_file, output_folder,
-                            pdf_names=PDF_NAMES, max_size_mb=MAX_PDF_SIZE_MB):
+# =====================================================================
+# MAIN
+# =====================================================================
+def run_tasks(tasks):
+    """Build all memname PDFs - in parallel when possible, otherwise one by one."""
+    if not tasks:
+        return []
+    if USE_PARALLEL and len(tasks) >= 3:
+        workers = max(1, min(MAX_WORKERS, (os.cpu_count() or 2) - 1, len(tasks)))
+        if workers > 1:
+            try:
+                with ProcessPoolExecutor(max_workers=workers) as ex:
+                    return list(ex.map(process_one, tasks, chunksize=1))
+            except Exception as e:
+                print(f"  (parallel build not available: {e}) - building one by one")
+    return [process_one(t) for t in tasks]
 
+
+def mock_generator_main(input_file, config_1, config_2, output_folder, is_merge,
+                        pdf_names=PDF_NAMES, max_size_mb=MAX_PDF_SIZE_MB):
+    """
+    config_1 = PROPOSED repository  -> highlight pages (changed cells in yellow)
+    config_2 = CURRENT  repository  -> strike pages    (removed/changed cells in red + strike)
+
+    Only memnames with Table_Include = Yes AND Exclude_Mock = No are printed.
+    is_merge = True : memnames with the same Group_Val go into the same PDF(s)
+    is_merge = False: every memname is its own group
+    """
     base_name = safe_filename(pdf_names)
     max_bytes = int(max_size_mb * 1024 * 1024)
 
     final_folder = os.path.join(output_folder, OUTPUT_SUBFOLDER)
     os.makedirs(final_folder, exist_ok=True)
 
-    temp_folder = tempfile.mkdtemp(prefix="memname_pdfs_")
-    merged_folder = tempfile.mkdtemp(prefix="merged_parts_")
+    temp_folder = tempfile.mkdtemp(prefix="mock_memname_pdfs_")
+    merged_folder = tempfile.mkdtemp(prefix="mock_merged_parts_")
 
     input_df = pd.read_excel(input_file, sheet_name="Filing_tabs")
     input_df.columns = input_df.columns.str.strip().str.lower()
 
-    if "group_val" not in input_df.columns:
+    if is_merge and "group_val" not in input_df.columns:
         raise ValueError(f"'Group_Val' column not found in Filing_tabs. Columns: {list(input_df.columns)}")
 
-    # group_val -> list of (memname, temp_pdf_path), order of first appearance kept
-    groups = {}
-    memname_srt = {}  # memname -> SRT_TAB_ID from input sheet
+    xl1 = pd.ExcelFile(config_1)
+    xl2 = pd.ExcelFile(config_2)
+    name1, name2 = os.path.basename(config_1), os.path.basename(config_2)
+
+    jobs = []           # one per memname that can be built: (group_val, srt, memname, task)
+    skipped_rows = []   # mapping rows for memnames that were skipped
+
+    def skip(group_val, srt, memname, reason):
+        print(f"  SKIPPED: {reason}")
+        skipped_rows.append({
+            "Group_Val": group_val, "SRT_TAB_ID": srt, "MemName": memname,
+            "PDF Name": NOT_CREATED, "PDF Part": "", "Remarks": reason, "Missing": True,
+        })
 
     try:
-        # ---------- Step 1: build one temp PDF per memname ----------
-        for _, row in input_df.iterrows():
+        # ---------- Step 1: read sheets, decide what to build ----------
+        for n, (_, row) in enumerate(input_df.iterrows(), start=1):
 
-            memname = str(row.get("memname", "")).strip()
-            if not memname or memname.lower() == "nan":
+            # only print when Table_Include = Yes and Exclude_Mock = No
+            check1 = safe_str(row.get("table_include", "")).lower()
+            check2 = safe_str(row.get("exclude_mock", "")).lower()
+            if not (check1 == "yes" and check2 == "no"):
                 continue
 
-            memname_srt[memname] = normalize_group(row.get("srt_tab_id", ""))
-            group_val = normalize_group(row.get("group_val", ""))
-            if group_val == "":
-                group_val = memname  # no group value -> its own group
+            memname = safe_str(row.get("memname", ""))
+            if not memname:
+                continue
+            tab_id = safe_str(row.get("srt_tab_id", ""))
 
-            print(f" Processing: {memname}  (Group_Val = {group_val})")
+            if is_merge:
+                group_val = normalize_group(row.get("group_val", "")) or memname
+            else:
+                group_val = memname
 
-            # Case-insensitive sheet name lookup
-            sheet_name = find_sheet_name_ci(config_file, memname)
+            print(f"\nProcessing -> {tab_id} : {memname}  (Group_Val = {group_val})")
 
-            df = pd.read_excel(config_file, sheet_name=sheet_name).fillna("")
-            df = df.map(clean_text) if hasattr(df, "map") else df.applymap(clean_text)
+            sheet1 = find_sheet(xl1, memname)
+            sheet2 = find_sheet(xl2, memname)
+            not_found = []
+            if sheet1 is None:
+                not_found.append(f"{name1} (proposed)")
+            if sheet2 is None:
+                not_found.append(f"{name2} (current)")
+            if not_found:
+                skip(group_val, tab_id, memname, "Sheet not found in: " + ", ".join(not_found))
+                continue
 
-            fixed_cols = get_fixed_columns(df)
+            try:
+                df1 = load_sheet(xl1, sheet1)     # proposed
+                df2 = load_sheet(xl2, sheet2)     # current
 
-            titles         = [str(row.get(f"title{i}", "")) for i in range(1, 5)]
-            version        = str(row.get("version_current", ""))
-            page_cnt_title = str(row.get("page_cnt_title", ""))
-            _, center, right = parse_footnote(str(row.get("footnote1", "")))
+                if df1.empty or df2.empty:
+                    skip(group_val, tab_id, memname, "No data rows in one of the config files")
+                    continue
 
-            drawer = make_page_drawer(titles, version, center, right, page_cnt_title)
+                key_cols = get_fixed_columns(df1)
+                missing = [c for c in key_cols if c not in df2.columns]
+                if missing:
+                    skip(group_val, tab_id, memname,
+                         f"Key column(s) {missing} missing in {name2} (current)")
+                    continue
 
-            tmp_pdf = os.path.join(temp_folder, f"{safe_filename(memname)}.pdf")
-            build_pdf(df, tmp_pdf, drawer, fixed_cols)
+                task = {
+                    "memname": memname,
+                    "df1": df1, "df2": df2, "key_cols": key_cols,
+                    "titles": [safe_str(row.get(f"title{i}", "")) for i in range(1, 5)],
+                    "page_cnt_title": safe_str(row.get("page_cnt_title", "")),
+                    "footnote_raw": safe_str(row.get("footnote1", "")),
+                    "base_path": os.path.join(temp_folder, f"{n:05d}"),
+                }
+                jobs.append((group_val, tab_id, memname, task))
 
-            groups.setdefault(group_val, []).append((memname, tmp_pdf))
+            except Exception as e:
+                print(f"ERROR while reading '{memname}':")
+                traceback.print_exc()
+                skip(group_val, tab_id, memname, f"Error: {e}")
 
-        # ---------- Step 2: merge per group (max size enforced) ----------
+        # ---------- Step 2: build all memname PDFs (fast, parallel) ----------
+        print(f"\nBuilding {len(jobs)} memname PDF(s) ...")
+        results = run_tasks([j[3] for j in jobs])
+
+        groups = {}                 # group_val -> [(memname, highlight_pdf, strike_pdf)], first-appearance order
+        memname_srt = {}
+        for (group_val, tab_id, memname, _), res in zip(jobs, results):
+            print(f"\n[{memname}]")
+            for line in res["log"]:
+                print(line)
+            if res["ok"]:
+                memname_srt[memname] = tab_id
+                groups.setdefault(group_val, []).append((memname, res["h_path"], res["s_path"]))
+            else:
+                skip(group_val, tab_id, memname, res["reason"])
+
+        # ---------- Step 3: merge per group (max size enforced) ----------
         all_parts = []  # (group_val, temp_path, memnames) in final order
 
         for group_val, items in groups.items():
-            print(f"\n Merging Group_Val = {group_val} ({len(items)} memname(s))")
+            print(f"\nMerging Group_Val = {group_val} ({len(items)} memname(s))")
             for tmp_path, memnames in merge_group(group_val, items, merged_folder, max_bytes):
                 all_parts.append((group_val, tmp_path, memnames))
 
-        # ---------- Step 2b: final names, numbered across ALL groups ----------
+        # ---------- Step 3b: final names, numbered across ALL groups ----------
         total_files = len(all_parts)
         mapping_rows = []
         all_pdfs = []
@@ -504,35 +797,33 @@ def generate_single_reports(input_file, config_file, output_folder,
                     "Group_Val":  group_val,
                     "SRT_TAB_ID": memname_srt.get(m, ""),
                     "MemName":    m,
-                    "PDF Name":  pdf_name,
-                    "PDF Part":  f"{file_no} of {total_files}",
+                    "PDF Name":   pdf_name,
+                    "PDF Part":   f"{file_no} of {total_files}",
+                    "Remarks":    "",
+                    "Missing":    False,
                 })
 
-        # ---------- Step 3: mapping Excel ----------
+        mapping_rows.extend(skipped_rows)   # skipped memnames at the bottom, in red
+
+        # ---------- Step 4: mapping Excel ----------
         mapping_path = os.path.join(final_folder, MAPPING_EXCEL_NAME)
         save_mapping_excel(mapping_rows, mapping_path)
-        print(f"\n Mapping sheet saved: {mapping_path}")
+        print(f"\nMapping sheet saved: {mapping_path}")
 
     finally:
         shutil.rmtree(temp_folder, ignore_errors=True)
         shutil.rmtree(merged_folder, ignore_errors=True)
 
-    print(" DONE")
+    print("\nDONE")
     return all_pdfs
 
 
-try:
-    generate_single_reports(
-        input_file=SAS.symget("input_file"),
-        config_file=SAS.symget("config_file"),
-        output_folder=SAS.symget("output_folder"),   # "Proffs" folder is created inside this
-        pdf_names=PDF_NAMES,
-        max_size_mb=MAX_PDF_SIZE_MB,
-    )
-except Exception:
-    print("ERROR DETAILS:")
-    print(traceback.format_exc())
-    raise
+if __name__ == "__main__":      # this guard is required for the parallel build on Windows
+    input_file = r"D:\filling_input_exl\input.xlsx"
+    config_1 = r"D:\filling_input_exl\config.xlsx"
+    config_2 = r"D:\filling_input_exl\config2.xlsx"
+    output_folder = r"D:\filling_input_exl"          # the "Mocks" folder is created inside this
+    is_merge = True
 
-endsubmit;
-run;
+    mock_generator_main(input_file, config_1, config_2, output_folder, is_merge,
+                        pdf_names=PDF_NAMES, max_size_mb=MAX_PDF_SIZE_MB)
